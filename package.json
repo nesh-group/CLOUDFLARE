@@ -1,0 +1,15 @@
+{
+  "name": "nesh-worker",
+  "version": "1.0.0",
+  "description": "NESH Delivery - Cloudflare Worker for order and ride alerts",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
