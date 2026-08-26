@@ -1,4 +1,4 @@
-name = "nesh-worker"
+name = "broad-paper-6445"
 main = "src/index.js"
 type = "service-worker"
 compatibility_date = "2024-01-01"
