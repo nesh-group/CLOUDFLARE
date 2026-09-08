@@ -172,7 +172,61 @@ export default {
       return new Response('Invalid JSON', { status: 400, headers: corsHeaders });
     }
 
-    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'otp' ? 'otp' : 'order'));
+    // ---------------------------------------------------------------------
+    // TOPIC SUBSCRIBE — a customer device registers its FCM token and asks
+    // to be subscribed to the "all_customers" topic, so a single broadcast
+    // send (below) reaches every customer without looking up every token
+    // individually. Called from index.html right after messaging.getToken()
+    // succeeds — for both logged-in customers and guests (guests just don't
+    // also get a customers/{phone}/fcmToken save).
+    // ---------------------------------------------------------------------
+    if (body.type === 'subscribe_topic') {
+      const { token } = body;
+      if (!token) return new Response('token required', { status: 400, headers: corsHeaders });
+      const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const subRes = await fetch(
+        `https://iid.googleapis.com/iid/v1/${token}/rel/topics/all_customers`,
+        { method: 'POST', headers: { Authorization: `Bearer ${accessToken2}` } }
+      );
+      return new Response(JSON.stringify({ ok: subRes.ok }), {
+        status: subRes.ok ? 200 : 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    // ---------------------------------------------------------------------
+    // BROADCAST — Operator Panel sends one announcement/offer to every
+    // customer subscribed to "all_customers", in a single FCM call
+    // (logged-in customers AND guests who granted notification permission).
+    // ---------------------------------------------------------------------
+    if (body.type === 'broadcast') {
+      const { title, body: msgBody } = body;
+      if (!title || !msgBody) return new Response('title and body required', { status: 400, headers: corsHeaders });
+      const serviceAccount2 = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const projectId2 = serviceAccount2.project_id;
+      const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const fcmRes = await fetch(
+        `https://fcm.googleapis.com/v1/projects/${projectId2}/messages:send`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessToken2}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: {
+              topic: 'all_customers',
+              notification: { title, body: msgBody },
+              android: { priority: 'high', notification: { title, body: msgBody } },
+            },
+          }),
+        }
+      );
+      const result = await fcmRes.json().catch(() => ({}));
+      return new Response(JSON.stringify({ ok: fcmRes.ok, result }), {
+        status: fcmRes.ok ? 200 : 500,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
+    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : 'order')));
 
     const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
     const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
@@ -329,6 +383,27 @@ export default {
       // is required to hear it.
       channelId = 'order_alerts';
       soundName = 'order_alert';
+    } else if (notifType === 'customer') {
+      // ---------------- CUSTOMER ORDER-STATUS ALERT ----------------
+      // Single-customer notification (order confirmed / delivered / etc.)
+      // — triggered from partner.html and driver.html. Looks up the token
+      // this one customer saved to customers/{phone}/fcmToken (separate
+      // from the "all_customers" topic used for broadcasts).
+      const { customerPhone, title, body: msgBody, orderId, restId } = body;
+      if (!customerPhone) return new Response('customerPhone required', { status: 400, headers: corsHeaders });
+
+      const custRes = await fetch(`${dbUrl}/customers/${customerPhone}.json`);
+      const cust = await custRes.json();
+      const token = cust && cust.fcmToken;
+      if (!token) {
+        return new Response('No FCM token for this customer', { status: 200, headers: corsHeaders });
+      }
+      tokens = [token];
+      notifTitle = title || 'Order update';
+      notifBody = msgBody || 'Tap to view your order';
+      dataPayload = { type: 'order_status', orderId: orderId || '', restId: restId || '' };
+      channelId = 'order_status_alerts';
+      soundName = 'default';
     } else if (notifType === 'otp') {
       // ---------------- OTP SMS RELAY (silent, no ring, no tray notification) ----------------
       // Called by the customer app right after it writes a fresh code to
@@ -618,7 +693,9 @@ async function getGoogleAccessToken(serviceAccountJson) {
     iss: sa.client_email,
     // messaging (to send pushes) + database (to write dispatch metadata,
     // e.g. rides/{id}.dispatch, so the escalation sweep can read it back)
-    scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database',
+    // + the general firebase scope (needed for the Instance ID API call
+    // that subscribes a token to the "all_customers" topic)
+    scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/firebase',
     aud: 'https://oauth2.googleapis.com/token',
     iat: now,
     exp: now + 3600,
