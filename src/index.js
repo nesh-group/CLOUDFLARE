@@ -226,6 +226,95 @@ export default {
       });
     }
 
+    // ---------------------------------------------------------------------
+    // CANCEL RING — tells whichever device(s) are currently ringing for a
+    // specific ride/delivery/order to stop, right away, instead of waiting
+    // out RingingService's own 25s AUTO_STOP_MS timeout (driver side) or
+    // ringing indefinitely (restaurant order side, which has no timeout at
+    // all). This must be handled here, BEFORE the notifType fallback below
+    // — previously a { type: 'cancel_ring', restId, orderId } call (the
+    // only caller today, in index.html's order-cancel flow) fell through
+    // to the `: 'order'` default and was sent out as a brand-new "New
+    // Order" alert to the restaurant, re-ringing the exact thing it was
+    // meant to silence.
+    //
+    // kind is optional for backward compatibility with that existing
+    // caller, which never sends it: rideId present -> 'ride', otherwise
+    // (restId/orderId only) -> 'order'. New callers (e.g. the taxi
+    // "Stop searching" flow) should pass kind explicitly.
+    if (body.type === 'cancel_ring') {
+      const { kind, rideId, restId, orderId } = body;
+      const resolvedKind = kind || (rideId ? 'ride' : 'order');
+      const dbUrlC = env.FIREBASE_DB_URL.replace(/\/$/, '');
+      const serviceAccountC = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const projectIdC = serviceAccountC.project_id;
+
+      let targetTokens = [];
+      let alertId = '';
+
+      if (resolvedKind === 'ride') {
+        if (!rideId) return new Response('rideId required', { status: 400, headers: corsHeaders });
+        alertId = rideId;
+        // Whoever this ride's most recent dispatch actually notified
+        // (nearest driver, or the widened broadcast list) is who might
+        // still be ringing — look those tokens up rather than guessing.
+        const rideRes = await fetch(`${dbUrlC}/rides/${rideId}.json`);
+        const ride = await rideRes.json().catch(() => null);
+        const notifiedIds = (ride && ride.dispatch && ride.dispatch.notifiedIds) || [];
+        if (notifiedIds.length) {
+          const driversRes = await fetch(`${dbUrlC}/taxi_drivers.json`);
+          const drivers = (await driversRes.json()) || {};
+          targetTokens = notifiedIds.map(id => drivers[id] && drivers[id].fcmToken).filter(Boolean);
+        }
+      } else if (resolvedKind === 'delivery') {
+        if (!restId || !orderId) return new Response('restId and orderId required', { status: 400, headers: corsHeaders });
+        alertId = `${restId}::${orderId}`;
+        const orderRes = await fetch(`${dbUrlC}/restaurants/${restId}/orders/${orderId}.json`);
+        const order = await orderRes.json().catch(() => null);
+        const notifiedIds = (order && order.dispatch && order.dispatch.notifiedIds) || [];
+        if (notifiedIds.length) {
+          const driversRes = await fetch(`${dbUrlC}/taxi_drivers.json`);
+          const drivers = (await driversRes.json()) || {};
+          targetTokens = notifiedIds.map(id => drivers[id] && drivers[id].fcmToken).filter(Boolean);
+        }
+      } else {
+        // 'order' — single fixed target, the restaurant's own saved token.
+        if (!restId) return new Response('restId required', { status: 400, headers: corsHeaders });
+        alertId = orderId || '';
+        const restRes = await fetch(`${dbUrlC}/restaurants/${restId}.json`);
+        const rest = await restRes.json().catch(() => null);
+        if (rest && rest.fcmToken) targetTokens = [rest.fcmToken];
+      }
+
+      if (!targetTokens.length) {
+        return new Response(JSON.stringify({ ok: true, sent: 0 }), {
+          status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
+      const accessTokenC = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      // Data-only, silent (no "notification" key, not in FULL_SCREEN_ALERT_TYPES)
+      // — this must never itself pop a tray notification or ring anything;
+      // it only carries an instruction for AlertFcmService to act on.
+      await Promise.all(targetTokens.map(fcmToken =>
+        fetch(`https://fcm.googleapis.com/v1/projects/${projectIdC}/messages:send`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessTokenC}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: {
+              token: fcmToken,
+              data: { type: 'cancel_ring', kind: resolvedKind, id: alertId },
+              android: { priority: 'high' },
+            },
+          }),
+        }).catch(() => {})
+      ));
+
+      return new Response(JSON.stringify({ ok: true, sent: targetTokens.length }), {
+        status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
+    }
+
     const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : 'order')));
 
     const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
