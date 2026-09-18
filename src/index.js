@@ -184,9 +184,17 @@ export default {
       const { token } = body;
       if (!token) return new Response('token required', { status: 400, headers: corsHeaders });
       const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      // The legacy Instance ID (IID) topic-management API defaults to
+      // expecting a legacy FCM server key in Authorization. To use an OAuth
+      // bearer token (a service account access token, as we do here) instead,
+      // Google requires this extra header — without it the request comes
+      // back 401/403 and the device silently never actually joins
+      // "all_customers", even though this fetch's caller (index.html) never
+      // checks the response and shows no error either. This is the reason
+      // broadcasts from the Operator Panel were reaching nobody.
       const subRes = await fetch(
         `https://iid.googleapis.com/iid/v1/${token}/rel/topics/all_customers`,
-        { method: 'POST', headers: { Authorization: `Bearer ${accessToken2}` } }
+        { method: 'POST', headers: { Authorization: `Bearer ${accessToken2}`, access_token_auth: 'true' } }
       );
       return new Response(JSON.stringify({ ok: subRes.ok }), {
         status: subRes.ok ? 200 : 500,
