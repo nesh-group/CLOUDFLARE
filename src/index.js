@@ -340,37 +340,52 @@ export default {
         customerName,
         customerPhone,
         fare,
+        driverId, // Choice Driver flow (index.html) — customer picked this
+                  // driver by hand, so skip nearest-ranking/broadcast
+                  // entirely and ring only them. No dispatchWrite either:
+                  // the Choice Driver flow has its own 25s timeout that
+                  // clears chosenDriverId, it never widens to other drivers.
       } = body;
-      if (!vehicleType) return new Response('vehicleType required', { status: 400, headers: corsHeaders });
 
-      const driversRes = await fetch(`${dbUrl}/taxi_drivers.json`);
-      const drivers = (await driversRes.json()) || {};
-      const matchFilter = d => d.isOnline === true && d.vehicleType === vehicleType && d.fcmToken && (!d.services || d.services.taxi !== false);
-
-      let chosen; // array of { id, driver, distanceKm }
-      const havePickup = typeof pickupLat === 'number' && typeof pickupLng === 'number';
-      if (havePickup) {
-        const ranked = rankDriversByDistance(drivers, { lat: pickupLat, lng: pickupLng }, matchFilter);
-        const withinRadius = ranked.filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-        // Nearest driver with a known fresh location — if nobody has a
-        // location on file yet, fall back to the old broadcast-to-all
-        // behaviour so this never silently strands a ride.
-        const nearest = withinRadius.find(r => r.distanceKm != null);
-        chosen = nearest ? [nearest] : withinRadius;
+      if (driverId) {
+        const driverRes = await fetch(`${dbUrl}/taxi_drivers/${driverId}.json`);
+        const driver = await driverRes.json().catch(() => null);
+        tokens = driver && driver.fcmToken ? [driver.fcmToken] : [];
+        if (!tokens.length) {
+          return new Response('No FCM token for this driver', { status: 200, headers: corsHeaders });
+        }
       } else {
-        chosen = Object.entries(drivers).filter(([id, d]) => d && matchFilter(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
-      }
+        if (!vehicleType) return new Response('vehicleType required', { status: 400, headers: corsHeaders });
 
-      tokens = chosen.map(c => c.driver.fcmToken).filter(Boolean);
-      if (!tokens.length) {
-        return new Response('No online drivers with a token for this vehicle type', { status: 200, headers: corsHeaders });
-      }
+        const driversRes = await fetch(`${dbUrl}/taxi_drivers.json`);
+        const drivers = (await driversRes.json()) || {};
+        const matchFilter = d => d.isOnline === true && d.vehicleType === vehicleType && d.fcmToken && (!d.services || d.services.taxi !== false);
 
-      if (rideId && havePickup && chosen.length === 1 && chosen[0].distanceKm != null) {
-        dispatchWrite = {
-          path: `rides/${rideId}`,
-          body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat, pickupLng } },
-        };
+        let chosen; // array of { id, driver, distanceKm }
+        const havePickup = typeof pickupLat === 'number' && typeof pickupLng === 'number';
+        if (havePickup) {
+          const ranked = rankDriversByDistance(drivers, { lat: pickupLat, lng: pickupLng }, matchFilter);
+          const withinRadius = ranked.filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
+          // Nearest driver with a known fresh location — if nobody has a
+          // location on file yet, fall back to the old broadcast-to-all
+          // behaviour so this never silently strands a ride.
+          const nearest = withinRadius.find(r => r.distanceKm != null);
+          chosen = nearest ? [nearest] : withinRadius;
+        } else {
+          chosen = Object.entries(drivers).filter(([id, d]) => d && matchFilter(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
+        }
+
+        tokens = chosen.map(c => c.driver.fcmToken).filter(Boolean);
+        if (!tokens.length) {
+          return new Response('No online drivers with a token for this vehicle type', { status: 200, headers: corsHeaders });
+        }
+
+        if (rideId && havePickup && chosen.length === 1 && chosen[0].distanceKm != null) {
+          dispatchWrite = {
+            path: `rides/${rideId}`,
+            body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat, pickupLng } },
+          };
+        }
       }
 
       notifTitle = 'New Ride Request' + (customerName ? ' — ' + customerName : '');
