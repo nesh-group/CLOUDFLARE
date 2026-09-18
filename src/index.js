@@ -200,11 +200,14 @@ export default {
     // (logged-in customers AND guests who granted notification permission).
     // ---------------------------------------------------------------------
     if (body.type === 'broadcast') {
-      const { title, body: msgBody } = body;
+      const { title, body: msgBody, image } = body;
       if (!title || !msgBody) return new Response('title and body required', { status: 400, headers: corsHeaders });
       const serviceAccount2 = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
       const projectId2 = serviceAccount2.project_id;
       const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      const notificationPayload = image
+        ? { title, body: msgBody, image }
+        : { title, body: msgBody };
       const fcmRes = await fetch(
         `https://fcm.googleapis.com/v1/projects/${projectId2}/messages:send`,
         {
@@ -213,8 +216,8 @@ export default {
           body: JSON.stringify({
             message: {
               topic: 'all_customers',
-              notification: { title, body: msgBody },
-              android: { priority: 'high', notification: { title, body: msgBody } },
+              notification: notificationPayload,
+              android: { priority: 'high', notification: notificationPayload },
             },
           }),
         }
