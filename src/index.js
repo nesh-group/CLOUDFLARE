@@ -326,7 +326,7 @@ export default {
       });
     }
 
-    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : 'order')));
+    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : (body.type === 'operator' ? 'operator' : 'order'))));
 
     const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
     const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
@@ -338,6 +338,7 @@ export default {
     // Trigger's `scheduled` handler reads this back to decide when to
     // widen from "nearest driver only" to a full broadcast.
     let dispatchWrite = null; // { path, body }
+    let operatorKeyByToken = null; // filled for 'operator' alerts so dead tokens can be cleaned up
 
     if (notifType === 'ride') {
       // ---------------- RIDE ALERT (driver app, nearest-first) ----------------
@@ -447,8 +448,18 @@ export default {
       ]);
       const drivers = (await driversRes.json()) || {};
       const rest = (await restRes.json()) || {};
+      // Only Go Series shops (Operator Panel → Go Series) route orders to
+      // bike delivery boys — every other shop arranges its own delivery, so
+      // it's never worth pinging a driver's phone for one. This mirrors
+      // partner.html's own client-side check; kept here too so this stays
+      // true no matter what calls this endpoint.
+      if (!rest.goSeries) {
+        return new Response('Shop is not in Go Series — not routed to delivery drivers', { status: 200, headers: corsHeaders });
+      }
       const pickup = parseLatLngStr(rest.location);
-      const matchFilter = d => d.isOnline === true && d.fcmToken && (!d.services || d.services.delivery !== false);
+      // Bike drivers only — matches driver.html's driverDoesDelivery(): auto/cab
+      // drivers never see delivery jobs in the app, so never ring them either.
+      const matchFilter = d => d.isOnline === true && d.vehicleType === 'bike' && d.fcmToken && (!d.services || d.services.delivery !== false);
 
       let chosen;
       if (pickup) {
@@ -519,6 +530,32 @@ export default {
       dataPayload = { type: 'order_status', orderId: orderId || '', restId: restId || '' };
       channelId = 'order_status_alerts';
       soundName = 'default';
+    } else if (notifType === 'operator') {
+      // ---------------- OPERATOR ALERT (Operator Panel devices) ----------------
+      // Sent by the customer app when a NESH Store order lands in the
+      // groceryOrderQueue waiting for the operator to pick a shop. Every
+      // device that has opened the Operator Panel in the native app saved
+      // its FCM token under operator_devices/{key} = { token, updatedAt };
+      // all of them get a normal sound notification (works even if the app
+      // is closed). No native-app change needed — it reuses the existing
+      // 'order_alerts' channel and its custom sound.
+      const { title, body: msgBody, orderId } = body;
+      const devRes = await fetch(`${dbUrl}/operator_devices.json`);
+      const devices = (await devRes.json()) || {};
+      operatorKeyByToken = {};
+      Object.keys(devices).forEach(k => {
+        const t = devices[k] && devices[k].token;
+        if (t) operatorKeyByToken[t] = k;
+      });
+      tokens = Object.keys(operatorKeyByToken);
+      if (!tokens.length) {
+        return new Response('No operator devices registered', { status: 200, headers: corsHeaders });
+      }
+      notifTitle = title || 'New order waiting';
+      notifBody = msgBody || 'Open the Operator Panel to assign it to a shop';
+      dataPayload = { type: 'operator_alert', orderId: orderId || '' };
+      channelId = 'order_alerts';
+      soundName = 'order_alert';
     } else if (notifType === 'otp') {
       // ---------------- OTP SMS RELAY (silent, no ring, no tray notification) ----------------
       // Called by the customer app right after it writes a fresh code to
@@ -662,6 +699,21 @@ export default {
       return { ok: fcmRes.ok, result };
     }));
 
+    // Operator alerts: forget any device whose token FCM says is dead.
+    if (operatorKeyByToken) {
+      await Promise.all(sendResults.map(async (r, i) => {
+        const err = r.result && r.result.error;
+        const dead = !r.ok && err && (err.status === 'NOT_FOUND' || err.status === 'UNREGISTERED' ||
+          (Array.isArray(err.details) && err.details.some(d => d.errorCode === 'UNREGISTERED')));
+        const key = dead ? operatorKeyByToken[tokens[i]] : null;
+        if (key) {
+          await fetch(`${dbUrl}/operator_devices/${key}.json`, {
+            method: 'DELETE', headers: { Authorization: `Bearer ${accessToken}` },
+          }).catch(() => {});
+        }
+      }));
+    }
+
     // 4. Save "who got notified, and when" so the Cron Trigger below (or
     //    a future call to this same worker) knows whether this ride/job
     //    is still in its nearest-driver-only window or is due to widen
@@ -743,7 +795,15 @@ async function runEscalationSweep(env) {
   });
 
   // ---- Delivery jobs still "ready" (unclaimed) past their window ----
+  // Only Go Series shops route to bike delivery boys at all (see
+  // partner.html's broadcastDeliveryJobToDrivers, which now only calls this
+  // worker's 'delivery' notify endpoint for Go Series shops) — so a
+  // non-Go-Series shop's order never gets a `dispatch` field written and is
+  // already skipped by the `d.stage !== 'nearest'` check below. This
+  // explicit rest.goSeries check is just a belt-and-braces guard against
+  // any older/stale dispatch data.
   Object.entries(restaurants).forEach(([restId, rest]) => {
+    if (!rest || !rest.goSeries) return;
     const orders = (rest && rest.orders) || {};
     Object.entries(orders).forEach(([orderId, order]) => {
       if (!order || order.status !== 'ready' || order.deliveryDriverId) return;
@@ -752,7 +812,7 @@ async function runEscalationSweep(env) {
       if (now - (d.notifiedAt || 0) < NEAREST_TIMEOUT_MS) return;
       const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : parseLatLngStr(rest.location);
       if (!pickup) return;
-      const matchFilter = dr => dr.isOnline === true && dr.fcmToken && (!dr.services || dr.services.delivery !== false) && !(d.notifiedIds || []).includes(dr._id);
+      const matchFilter = dr => dr.isOnline === true && dr.vehicleType === 'bike' && dr.fcmToken && (!dr.services || dr.services.delivery !== false) && !(d.notifiedIds || []).includes(dr._id);
       const ranked = rankDriversByDistance(drivers, pickup, () => true)
         .filter(r => matchFilter(Object.assign({ _id: r.id }, r.driver)))
         .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
