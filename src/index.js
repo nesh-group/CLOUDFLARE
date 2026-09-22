@@ -82,7 +82,12 @@
 // How long the nearest driver alone gets before we widen to everyone
 // nearby. Real escalation timing is bounded below by the Cron Trigger's
 // minute-level granularity (see `scheduled` below), not this constant.
+// Applies to taxi rides.
 const NEAREST_TIMEOUT_MS = 25 * 1000;
+// Same idea, but for Go Series delivery jobs specifically — kept separate
+// so delivery's nearest-only window can be tuned without touching taxi
+// rides. Mirrors DELIVERY_NEAREST_WINDOW_MS in driver.html.
+const DELIVERY_NEAREST_TIMEOUT_MS = 2 * 60 * 1000;
 // Radius used both for picking the nearest driver and (mainly) for the
 // broadcast fallback — drivers further than this are assumed too far to
 // bother alerting.
@@ -326,7 +331,7 @@ export default {
       });
     }
 
-    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : (body.type === 'operator' ? 'operator' : 'order'))));
+    const notifType = body.type === 'ride' ? 'ride' : (body.type === 'delivery' ? 'delivery' : (body.type === 'delivery_ready' ? 'delivery_ready' : (body.type === 'customer' ? 'customer' : (body.type === 'otp' ? 'otp' : (body.type === 'operator' ? 'operator' : 'order')))));
 
     const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
     const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
@@ -530,6 +535,34 @@ export default {
       dataPayload = { type: 'order_status', orderId: orderId || '', restId: restId || '' };
       channelId = 'order_status_alerts';
       soundName = 'default';
+    } else if (notifType === 'delivery_ready') {
+      // ---------------- PICKUP-READY ALERT (single delivery driver) ----------------
+      // Sent by partner.html the moment a shop taps "Mark as ready", but
+      // only when that order already has a driver assigned
+      // (order.deliveryDriverId) — i.e. the driver accepted it earlier
+      // while it was still "preparing" and is presumably already on the
+      // way to the shop. Swiggy-style: tells that one driver's phone
+      // "it's ready, come collect it now" instead of leaving them to
+      // notice the status change on their own. Reuses the 'order_alerts'
+      // channel/sound so no native app change is needed.
+      const { driverId, restName, orderNumber, orderId, restId } = body;
+      if (!driverId) return new Response('driverId required', { status: 400, headers: corsHeaders });
+
+      const driverRes = await fetch(`${dbUrl}/taxi_drivers/${driverId}.json`);
+      const driver = await driverRes.json();
+      const token = driver && driver.fcmToken;
+      if (!token) {
+        return new Response('No FCM token for this driver', { status: 200, headers: corsHeaders });
+      }
+      tokens = [token];
+      notifTitle = 'Pickup Ready!' + (restName ? ' — ' + restName : '');
+      notifBody = 'Order' + (orderNumber ? ' #' + orderNumber : '') + ' is ready for pickup. Head over now.';
+      dataPayload = { type: 'pickup_ready', restId: restId || '', orderId: orderId || '' };
+      // Dedicated no-sound, vibration-only channel (created natively in
+      // MainActivity.java — see pickup_ready_alerts in build-apk.yml).
+      // Vibration pattern lives on the channel itself; nothing to set here.
+      channelId = 'pickup_ready_alerts';
+      soundName = null;
     } else if (notifType === 'operator') {
       // ---------------- OPERATOR ALERT (Operator Panel devices) ----------------
       // Sent by the customer app when a NESH Store order lands in the
@@ -809,7 +842,7 @@ async function runEscalationSweep(env) {
       if (!order || order.status !== 'ready' || order.deliveryDriverId) return;
       const d = order.dispatch;
       if (!d || d.stage !== 'nearest') return;
-      if (now - (d.notifiedAt || 0) < NEAREST_TIMEOUT_MS) return;
+      if (now - (d.notifiedAt || 0) < DELIVERY_NEAREST_TIMEOUT_MS) return;
       const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : parseLatLngStr(rest.location);
       if (!pickup) return;
       const matchFilter = dr => dr.isOnline === true && dr.vehicleType === 'bike' && dr.fcmToken && (!dr.services || dr.services.delivery !== false) && !(d.notifiedIds || []).includes(dr._id);
