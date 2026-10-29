@@ -101,7 +101,7 @@ const LOCATION_STALE_MS = 3 * 60 * 1000;
 // app is fully killed, letting it show a native full-screen incoming-alert
 // screen instead of a plain system-tray notification). Shared by both the
 // main request handler and the Cron escalation sweep below.
-const FULL_SCREEN_ALERT_TYPES = new Set(['new_ride', 'new_order', 'new_delivery']);
+const FULL_SCREEN_ALERT_TYPES = new Set(['new_ride', 'new_order', 'new_delivery', 'new_operator_order']);
 
 // Data-only alerts that must reach the app even when fully killed, but are
 // NEVER shown to the person at all — no ring, no tray notification. Right
@@ -151,6 +151,42 @@ function rankDriversByDistance(drivers, pickup, filterFn) {
     });
 }
 
+// Alerts every device that has opened the Operator Panel (operator_devices/{key}).
+//  - NEW app (device saved fs:2): data-only push -> app shows a FULL-SCREEN, SILENT alert.
+//  - OLD app (no fs flag): gets NOTHING. An old app has no silent channel, so any
+//    notification we send would make Android play a sound. Silence > sound, so they
+//    are skipped until they update the APK (they still see orders inside the panel).
+// Best-effort: failures are swallowed so they can never break the shop's own order alert.
+async function notifyOperatorDevices(env, { title, body, orderId }) {
+  try {
+    const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
+    const devices = (await (await fetch(`${dbUrl}/operator_devices.json`)).json()) || {};
+    const list = Object.keys(devices).map((k) => ({ key: k, token: devices[k] && devices[k].token, fs: devices[k] && devices[k].fs })).filter((d) => d.token && d.fs >= 2); // old apps skipped on purpose (see above)
+    if (!list.length) return;
+    const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    const accessToken = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    await Promise.all(list.map(async (d) => {
+      const message = {
+        token: d.token,
+        data: { type: 'new_operator_order', orderId: orderId || '', title: String(title || ''), body: String(body || '') },
+        android: { priority: 'high' },
+      };
+      const res = await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+      if (!res.ok) {
+        const r = await res.json().catch(() => ({}));
+        const err = r && r.error;
+        const dead = err && (err.status === 'NOT_FOUND' || err.status === 'UNREGISTERED' ||
+          (Array.isArray(err.details) && err.details.some((x) => x.errorCode === 'UNREGISTERED')));
+        if (dead) await fetch(`${dbUrl}/operator_devices/${d.key}.json`, { method: 'DELETE', headers: { Authorization: `Bearer ${accessToken}` } }).catch(() => {});
+      }
+    }));
+  } catch (e) { /* never block the order alert */ }
+}
+
 export default {
   async fetch(request, env) {
     // CORS: lets the customer/driver apps (running in a browser) call
@@ -188,6 +224,13 @@ export default {
     if (body.type === 'subscribe_topic') {
       const { token } = body;
       if (!token) return new Response('token required', { status: 400, headers: corsHeaders });
+      // NEW: optional zone topics. Without them -> old behaviour (all_customers only).
+      //   topics: ['zone_<id>', ...]       -> also subscribe to these zone topics
+      //   unsubscribeTopics: ['zone_<id>'] -> leave these zone topics (customer moved to another zone)
+      // Only "zone_" topics are accepted so nobody can mess with other topics.
+      const okTopic = t => typeof t === 'string' && /^zone_[A-Za-z0-9_\-.~%]{1,100}$/.test(t);
+      const addTopics = Array.isArray(body.topics) ? body.topics.filter(okTopic).slice(0, 10) : [];
+      const delTopics = Array.isArray(body.unsubscribeTopics) ? body.unsubscribeTopics.filter(okTopic).slice(0, 10) : [];
       const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
       // The legacy Instance ID (IID) topic-management API defaults to
       // expecting a legacy FCM server key in Authorization. To use an OAuth
@@ -197,12 +240,27 @@ export default {
       // "all_customers", even though this fetch's caller (index.html) never
       // checks the response and shows no error either. This is the reason
       // broadcasts from the Operator Panel were reaching nobody.
+      const iidHeaders = { Authorization: `Bearer ${accessToken2}`, access_token_auth: 'true' };
       const subRes = await fetch(
         `https://iid.googleapis.com/iid/v1/${token}/rel/topics/all_customers`,
-        { method: 'POST', headers: { Authorization: `Bearer ${accessToken2}`, access_token_auth: 'true' } }
+        { method: 'POST', headers: iidHeaders }
       );
-      return new Response(JSON.stringify({ ok: subRes.ok }), {
-        status: subRes.ok ? 200 : 500,
+      let zoneOk = true;
+      for (const t of addTopics) {
+        const r = await fetch(`https://iid.googleapis.com/iid/v1/${token}/rel/topics/${t}`, { method: 'POST', headers: iidHeaders });
+        if (!r.ok) zoneOk = false;
+      }
+      for (const t of delTopics) {
+        const r = await fetch('https://iid.googleapis.com/iid/v1:batchRemove', {
+          method: 'POST',
+          headers: { ...iidHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: '/topics/' + t, registration_tokens: [token] }),
+        });
+        if (!r.ok) zoneOk = false;
+      }
+      const allOk = subRes.ok && zoneOk;
+      return new Response(JSON.stringify({ ok: allOk }), {
+        status: allOk ? 200 : 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
       });
     }
@@ -215,29 +273,39 @@ export default {
     if (body.type === 'broadcast') {
       const { title, body: msgBody, image } = body;
       if (!title || !msgBody) return new Response('title and body required', { status: 400, headers: corsHeaders });
+      // NEW: optional zoneIds -> send ONLY to customers whose last location is in those zones
+      // (they are subscribed to topic "zone_<id>"). No zoneIds -> everyone ("all_customers"), as before.
+      const zoneIds = Array.isArray(body.zoneIds)
+        ? body.zoneIds.filter(z => typeof z === 'string' && /^[A-Za-z0-9_\-.~%]{1,100}$/.test(z)).slice(0, 20)
+        : [];
       const serviceAccount2 = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
       const projectId2 = serviceAccount2.project_id;
       const accessToken2 = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
       const notificationPayload = image
         ? { title, body: msgBody, image }
         : { title, body: msgBody };
-      const fcmRes = await fetch(
+      const sendToTopic = (topicName) => fetch(
         `https://fcm.googleapis.com/v1/projects/${projectId2}/messages:send`,
         {
           method: 'POST',
           headers: { Authorization: `Bearer ${accessToken2}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message: {
-              topic: 'all_customers',
+              topic: topicName,
               notification: notificationPayload,
               android: { priority: 'high', notification: notificationPayload },
             },
           }),
         }
       );
-      const result = await fcmRes.json().catch(() => ({}));
-      return new Response(JSON.stringify({ ok: fcmRes.ok, result }), {
-        status: fcmRes.ok ? 200 : 500,
+      const topicList = zoneIds.length ? zoneIds.map(z => 'zone_' + z) : ['all_customers'];
+      const fcmResults = await Promise.all(topicList.map(async t => {
+        const r = await sendToTopic(t);
+        return { topic: t, ok: r.ok, result: await r.json().catch(() => ({})) };
+      }));
+      const allSent = fcmResults.every(r => r.ok);
+      return new Response(JSON.stringify({ ok: allSent, result: fcmResults }), {
+        status: allSent ? 200 : 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
       });
     }
@@ -573,22 +641,12 @@ export default {
       // is closed). No native-app change needed — it reuses the existing
       // 'order_alerts' channel and its custom sound.
       const { title, body: msgBody, orderId } = body;
-      const devRes = await fetch(`${dbUrl}/operator_devices.json`);
-      const devices = (await devRes.json()) || {};
-      operatorKeyByToken = {};
-      Object.keys(devices).forEach(k => {
-        const t = devices[k] && devices[k].token;
-        if (t) operatorKeyByToken[t] = k;
+      await notifyOperatorDevices(env, {
+        title: title || 'New order waiting',
+        body: msgBody || 'Open the Operator Panel to assign it to a shop',
+        orderId: orderId || '',
       });
-      tokens = Object.keys(operatorKeyByToken);
-      if (!tokens.length) {
-        return new Response('No operator devices registered', { status: 200, headers: corsHeaders });
-      }
-      notifTitle = title || 'New order waiting';
-      notifBody = msgBody || 'Open the Operator Panel to assign it to a shop';
-      dataPayload = { type: 'operator_alert', orderId: orderId || '' };
-      channelId = 'order_alerts';
-      soundName = 'order_alert';
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
     } else if (notifType === 'otp') {
       // ---------------- OTP SMS RELAY (silent, no ring, no tray notification) ----------------
       // Called by the customer app right after it writes a fresh code to
@@ -638,6 +696,13 @@ export default {
       // 1. Look up the restaurant's saved FCM token from Firebase RTDB.
       const restRes = await fetch(`${dbUrl}/restaurants/${restId}.json`);
       const rest = await restRes.json();
+      // Also tell every Operator Panel device (silent notification, no sound).
+      // Runs even if this shop has no FCM token; never blocks the shop's own alert.
+      await notifyOperatorDevices(env, {
+        title: 'New order' + (orderNumber ? ' #' + orderNumber : '') + ' — ' + ((rest && (rest.restaurantName || rest.name)) || 'Shop'),
+        body: [itemsSummary, totalAmount ? 'Total: ₹' + totalAmount : '', customerName].filter(Boolean).join(' · ') || 'Open the Operator Panel',
+        orderId: orderId || '',
+      });
       const token = rest && rest.fcmToken;
       if (!token) {
         return new Response('No FCM token for this restaurant', { status: 200, headers: corsHeaders });
@@ -777,6 +842,7 @@ export default {
   // ---------------------------------------------------------------------
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runEscalationSweep(env));
+    ctx.waitUntil(runLoyaltyReminderSweep(env).catch(() => {}));   // Hero Offer: 'reward expires soon' push
   },
 };
 
@@ -953,4 +1019,87 @@ function arrayBufferToBase64Url(buf) {
   const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.byteLength; i++) str += String.fromCharCode(bytes[i]);
   return btoa(str).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+
+// ---------------------------------------------------------------------
+// HERO OFFER (loyalty reward) — AUTOMATIC "your reward expires soon" PUSH.
+// Runs from the same Cron Trigger as the sweep above (cron = every minute,
+// this only does work once every 10 minutes). Uses the settings the operator
+// saves in partner.html -> Loyalty Reward (app_config/loyalty):
+//   discDays / prodDays = days a CLAIMED coupon / free item stays valid
+//   remindHours         = send when this many hours are left (blank = 24, 0 = off)
+// Customers who claimed are at loyalty/{phone}/claimedAt (cleared by the app
+// once the reward is used). expNotified = the claimedAt a reminder was
+// already sent for, so each claim gets exactly one push. Token comes from
+// customers/{phone}/fcmToken, same as the 'customer' push above.
+// ---------------------------------------------------------------------
+function loyaltyRewardTextW(v) {
+  if (v.rewardType === 'product') return 'FREE ' + (v.productName || 'gift');
+  const x = Number(v.value) || 0;
+  return v.type === 'percent' ? x + '% OFF' + (Number(v.maxDiscount) > 0 ? ' (up to \u20B9' + v.maxDiscount + ')' : '') : '\u20B9' + x + ' OFF';
+}
+function loyaltyFmtDateW(ms) {
+  return new Date(ms).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+function loyaltyLeftW(ms) {
+  if (ms <= 0) return '0m';
+  const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
+  return d ? d + 'd ' + h + 'h' : (h ? h + 'h ' : '') + (m % 60) + 'm';
+}
+async function runLoyaltyReminderSweep(env) {
+  const now = Date.now();
+  if (new Date(now).getUTCMinutes() % 10 !== 0) return;   // every 10 minutes is plenty
+  const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
+  const projectId = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON).project_id;
+  const accessToken = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const auth = { Authorization: `Bearer ${accessToken}` };
+
+  const cfg = await (await fetch(`${dbUrl}/app_config/loyalty.json`, { headers: auth })).json();
+  if (!cfg || cfg.on === false) return;
+  if (Number(cfg.endAt) > 0 && Number(cfg.endAt) <= now) return;   // whole Hero Offer already ended
+  const days = Math.max(0, Number(cfg.rewardType === 'product' ? cfg.prodDays : cfg.discDays) || 0);
+  const rem = cfg.remindHours == null ? 24 : Number(cfg.remindHours);
+  if (!(days > 0) || !(rem > 0) || days * 24 <= rem) return;   // no expiry, reminder off, or reward shorter than the reminder window
+
+  // only customers who have a claimed reward; falls back to reading the node if Firebase has no index on claimedAt
+  let all = null;
+  try {
+    const qr = await fetch(`${dbUrl}/loyalty.json?orderBy=%22claimedAt%22&startAt=1`, { headers: auth });
+    const qj = await qr.json();
+    if (qr.ok && !(qj && qj.error)) all = qj || {};
+  } catch (e) {}
+  if (all === null) all = (await (await fetch(`${dbUrl}/loyalty.json`, { headers: auth })).json()) || {};
+
+  for (const [phone, c] of Object.entries(all)) {
+    const at = Number(c && c.claimedAt) || 0;
+    if (!at) continue;
+    const exp = at + days * 86400000;
+    if (exp <= now || exp - now > rem * 3600000 || c.expNotified === at) continue;
+
+    // mark first, so a slow or failed send is never repeated every 10 minutes
+    await fetch(`${dbUrl}/loyalty/${phone}/expNotified.json`, {
+      method: 'PUT', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(at),
+    }).catch(() => {});
+
+    const cust = await (await fetch(`${dbUrl}/customers/${phone}.json`, { headers: auth })).json().catch(() => null);
+    const token = cust && cust.fcmToken;
+    if (!token) continue;
+
+    const rt = loyaltyRewardTextW(cfg).replace(/ \(up to[^)]*\)/, ''), left = loyaltyLeftW(exp - now), when = loyaltyFmtDateW(exp);
+    const title = cfg.rewardType === 'product' ? `\uD83C\uDF81 Your ${rt} is waiting!` : `\u23F3 Your ${rt} reward expires soon!`;
+    const body = cfg.rewardType === 'product'
+      ? `\u23F3 Only ${left} left \u2014 it expires on ${when}. Order now and grab it before it's gone! \uD83C\uDF89`
+      : `Last chance! It ends on ${when} (${left} left). Order now & save before it's gone! \uD83C\uDF89`;
+    await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
+      method: 'POST',
+      headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: {
+        token,
+        notification: { title, body },
+        data: { type: 'order_status', orderId: '', restId: '' },
+        android: { priority: 'high', notification: { channel_id: 'order_status_alerts', sound: 'default', title, body } },
+      } }),
+    }).catch(() => {});
+  }
 }
