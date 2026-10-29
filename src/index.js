@@ -161,14 +161,14 @@ async function notifyOperatorDevices(env, { title, body, orderId }) {
   try {
     const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
     const devices = (await (await fetch(`${dbUrl}/operator_devices.json`)).json()) || {};
-    const list = Object.keys(devices).map((k) => ({ key: k, token: devices[k] && devices[k].token, fs: devices[k] && devices[k].fs })).filter((d) => d.token && d.fs >= 2); // old apps skipped on purpose (see above)
+    const list = Object.keys(devices).map((k) => ({ key: k, token: devices[k] && devices[k].token, fs: devices[k] && devices[k].fs, sound: devices[k] && devices[k].sound, vibrate: devices[k] && devices[k].vibrate })).filter((d) => d.token && d.fs >= 2); // old apps skipped on purpose (see above)
     if (!list.length) return;
     const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
     const accessToken = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
     await Promise.all(list.map(async (d) => {
       const message = {
         token: d.token,
-        data: { type: 'new_operator_order', orderId: orderId || '', title: String(title || ''), body: String(body || '') },
+        data: { type: 'new_operator_order', orderId: orderId || '', title: String(title || ''), body: String(body || ''), sound: d.sound ? '1' : '0', vibrate: d.vibrate ? '1' : '0' },
         android: { priority: 'high' },
       };
       const res = await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
@@ -642,7 +642,7 @@ export default {
       // 'order_alerts' channel and its custom sound.
       const { title, body: msgBody, orderId } = body;
       await notifyOperatorDevices(env, {
-        title: title || 'New order waiting',
+        title: title || 'പുതിയ ഓർഡർ — NESH Store',
         body: msgBody || 'Open the Operator Panel to assign it to a shop',
         orderId: orderId || '',
       });
@@ -699,8 +699,9 @@ export default {
       // Also tell every Operator Panel device (silent notification, no sound).
       // Runs even if this shop has no FCM token; never blocks the shop's own alert.
       await notifyOperatorDevices(env, {
-        title: 'New order' + (orderNumber ? ' #' + orderNumber : '') + ' — ' + ((rest && (rest.restaurantName || rest.name)) || 'Shop'),
-        body: [itemsSummary, totalAmount ? 'Total: ₹' + totalAmount : '', customerName].filter(Boolean).join(' · ') || 'Open the Operator Panel',
+        // Operator format: shop + total first (what the operator scans for), then order #, items, customer.
+        title: 'പുതിയ ഓർഡർ — ' + ((rest && (rest.restaurantName || rest.name)) || 'Shop') + (totalAmount ? ' · ₹' + totalAmount : ''),
+        body: [orderNumber ? 'Order #' + orderNumber : '', itemsSummary, customerName].filter(Boolean).join(' · ') || 'Open the Operator Panel',
         orderId: orderId || '',
       });
       const token = rest && rest.fcmToken;
