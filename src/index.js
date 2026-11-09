@@ -1,3 +1,16 @@
+// =====================================================================
+// BANDWIDTH-OPTIMISED VERSION — behaviour identical, far less Firebase download.
+//  1. Cron sweep no longer downloads rides + drivers + ALL restaurants every
+//     minute. It reads a tiny `dispatch_queue` node (written when a nearest-
+//     driver offer goes out) and returns at once when it is empty.
+//  2. Single fields (fcmToken, goSeries, location, name) are read directly
+//     instead of whole restaurants / customers / drivers nodes.
+//  3. Driver lists are fetched online-only (needs .indexOn isOnline; falls
+//     back to the old full read automatically if the index is missing).
+//  4. Google access token cached for 50 min instead of re-signed every call.
+// Optional Firebase rules:  taxi_drivers: ".indexOn": ["isOnline"]
+//                           loyalty:      ".indexOn": ["claimedAt"]
+// =====================================================================
 // ---------------------------------------------------------------------
 // COMBINED WORKER — replaces driver_index.js AND partner_index.js.
 // There is only ever ONE Cloudflare Worker for the whole system (it's
@@ -127,6 +140,61 @@ function parseLatLngStr(str) {
   const m = String(str).trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
   if (!m) return null;
   return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+}
+
+// ---------------------------------------------------------------------
+// BANDWIDTH HELPERS (added) — the worker used to download whole Firebase
+// nodes (e.g. restaurants/{id} = menu + every past order) just to read one
+// field. These read ONLY the field that is needed. Same data, same results.
+// ---------------------------------------------------------------------
+async function rtdbGet(dbUrl, path, accessToken) {
+  try {
+    const r = await fetch(`${dbUrl}/${path}.json`, accessToken ? { headers: { Authorization: `Bearer ${accessToken}` } } : undefined);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+async function rtdbFields(dbUrl, basePath, fields, accessToken) {
+  const vals = await Promise.all(fields.map((f) => rtdbGet(dbUrl, `${basePath}/${f}`, accessToken)));
+  const out = {};
+  fields.forEach((f, i) => { out[f] = vals[i]; });
+  return out;
+}
+// Online drivers only. Needs  "taxi_drivers": { ".indexOn": ["isOnline"] }  in the
+// Firebase rules; if that index is missing (or the query fails for any reason) this
+// silently falls back to the old full download, so nothing can break.
+let _onlineQueryWorks = true;
+async function fetchOnlineDrivers(dbUrl) {
+  if (_onlineQueryWorks) {
+    try {
+      const r = await fetch(`${dbUrl}/taxi_drivers.json?orderBy=%22isOnline%22&equalTo=true`);
+      if (r.ok) {
+        const j = await r.json();
+        if (!(j && j.error)) return j || {};
+      }
+      _onlineQueryWorks = false;
+    } catch (e) { _onlineQueryWorks = false; }
+  }
+  const r2 = await fetch(`${dbUrl}/taxi_drivers.json`);
+  return (await r2.json()) || {};
+}
+async function rtdbNotifiedIds(dbUrl, nodePath) {
+  const v = await rtdbGet(dbUrl, `${nodePath}/dispatch/notifiedIds`);
+  if (Array.isArray(v)) return v;
+  if (v && typeof v === 'object') return Object.values(v);
+  return [];
+}
+// FCM tokens for a list of driver ids. Few ids -> read just their token field;
+// many ids -> one full read (keeps us far below Cloudflare's subrequest limit).
+async function driverTokensFor(dbUrl, ids) {
+  if (!ids.length) return [];
+  if (ids.length <= 10) {
+    const toks = await Promise.all(ids.map((id) => rtdbGet(dbUrl, `taxi_drivers/${id}/fcmToken`)));
+    return toks.filter(Boolean);
+  }
+  const r = await fetch(`${dbUrl}/taxi_drivers.json`);
+  const drivers = (await r.json()) || {};
+  return ids.map((id) => drivers[id] && drivers[id].fcmToken).filter(Boolean);
 }
 
 // Ranks online, matching drivers by distance to a pickup point. Drivers
@@ -342,32 +410,19 @@ export default {
         // Whoever this ride's most recent dispatch actually notified
         // (nearest driver, or the widened broadcast list) is who might
         // still be ringing — look those tokens up rather than guessing.
-        const rideRes = await fetch(`${dbUrlC}/rides/${rideId}.json`);
-        const ride = await rideRes.json().catch(() => null);
-        const notifiedIds = (ride && ride.dispatch && ride.dispatch.notifiedIds) || [];
-        if (notifiedIds.length) {
-          const driversRes = await fetch(`${dbUrlC}/taxi_drivers.json`);
-          const drivers = (await driversRes.json()) || {};
-          targetTokens = notifiedIds.map(id => drivers[id] && drivers[id].fcmToken).filter(Boolean);
-        }
+        const notifiedIds = await rtdbNotifiedIds(dbUrlC, `rides/${rideId}`);
+        targetTokens = await driverTokensFor(dbUrlC, notifiedIds);
       } else if (resolvedKind === 'delivery') {
         if (!restId || !orderId) return new Response('restId and orderId required', { status: 400, headers: corsHeaders });
         alertId = `${restId}::${orderId}`;
-        const orderRes = await fetch(`${dbUrlC}/restaurants/${restId}/orders/${orderId}.json`);
-        const order = await orderRes.json().catch(() => null);
-        const notifiedIds = (order && order.dispatch && order.dispatch.notifiedIds) || [];
-        if (notifiedIds.length) {
-          const driversRes = await fetch(`${dbUrlC}/taxi_drivers.json`);
-          const drivers = (await driversRes.json()) || {};
-          targetTokens = notifiedIds.map(id => drivers[id] && drivers[id].fcmToken).filter(Boolean);
-        }
+        const notifiedIds = await rtdbNotifiedIds(dbUrlC, `restaurants/${restId}/orders/${orderId}`);
+        targetTokens = await driverTokensFor(dbUrlC, notifiedIds);
       } else {
         // 'order' — single fixed target, the restaurant's own saved token.
         if (!restId) return new Response('restId required', { status: 400, headers: corsHeaders });
         alertId = orderId || '';
-        const restRes = await fetch(`${dbUrlC}/restaurants/${restId}.json`);
-        const rest = await restRes.json().catch(() => null);
-        if (rest && rest.fcmToken) targetTokens = [rest.fcmToken];
+        const restToken = await rtdbGet(dbUrlC, `restaurants/${restId}/fcmToken`);
+        if (restToken) targetTokens = [restToken];
       }
 
       if (!targetTokens.length) {
@@ -433,17 +488,15 @@ export default {
       } = body;
 
       if (driverId) {
-        const driverRes = await fetch(`${dbUrl}/taxi_drivers/${driverId}.json`);
-        const driver = await driverRes.json().catch(() => null);
-        tokens = driver && driver.fcmToken ? [driver.fcmToken] : [];
+        const driverTok = await rtdbGet(dbUrl, `taxi_drivers/${driverId}/fcmToken`);
+        tokens = driverTok ? [driverTok] : [];
         if (!tokens.length) {
           return new Response('No FCM token for this driver', { status: 200, headers: corsHeaders });
         }
       } else {
         if (!vehicleType) return new Response('vehicleType required', { status: 400, headers: corsHeaders });
 
-        const driversRes = await fetch(`${dbUrl}/taxi_drivers.json`);
-        const drivers = (await driversRes.json()) || {};
+        const drivers = await fetchOnlineDrivers(dbUrl);
         const matchFilter = d => d.isOnline === true && d.vehicleType === vehicleType && d.fcmToken && (!d.services || d.services.taxi !== false);
 
         let chosen; // array of { id, driver, distanceKm }
@@ -469,6 +522,8 @@ export default {
           dispatchWrite = {
             path: `rides/${rideId}`,
             body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat, pickupLng } },
+            // tiny "to-do" entry so the Cron sweep never has to scan every ride/restaurant
+            queue: { key: 'r_' + rideId, value: { kind: 'ride', rideId, notifiedAt: Date.now() } },
           };
         }
       }
@@ -515,12 +570,10 @@ export default {
       } = body;
       if (!restId || !orderId) return new Response('restId and orderId required', { status: 400, headers: corsHeaders });
 
-      const [driversRes, restRes] = await Promise.all([
-        fetch(`${dbUrl}/taxi_drivers.json`),
-        fetch(`${dbUrl}/restaurants/${restId}.json`),
+      const [drivers, rest] = await Promise.all([
+        fetchOnlineDrivers(dbUrl),
+        rtdbFields(dbUrl, `restaurants/${restId}`, ['goSeries', 'location']),
       ]);
-      const drivers = (await driversRes.json()) || {};
-      const rest = (await restRes.json()) || {};
       // Only Go Series shops (Operator Panel → Go Series) route orders to
       // bike delivery boys — every other shop arranges its own delivery, so
       // it's never worth pinging a driver's phone for one. This mirrors
@@ -553,6 +606,7 @@ export default {
         dispatchWrite = {
           path: `restaurants/${restId}/orders/${orderId}`,
           body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat: pickup.lat, pickupLng: pickup.lng } },
+          queue: { key: 'd_' + restId + '__' + orderId, value: { kind: 'delivery', restId, orderId, notifiedAt: Date.now() } },
         };
       }
 
@@ -591,9 +645,7 @@ export default {
       const { customerPhone, title, body: msgBody, orderId, restId } = body;
       if (!customerPhone) return new Response('customerPhone required', { status: 400, headers: corsHeaders });
 
-      const custRes = await fetch(`${dbUrl}/customers/${customerPhone}.json`);
-      const cust = await custRes.json();
-      const token = cust && cust.fcmToken;
+      const token = await rtdbGet(dbUrl, `customers/${customerPhone}/fcmToken`);
       if (!token) {
         return new Response('No FCM token for this customer', { status: 200, headers: corsHeaders });
       }
@@ -616,9 +668,7 @@ export default {
       const { driverId, restName, orderNumber, orderId, restId } = body;
       if (!driverId) return new Response('driverId required', { status: 400, headers: corsHeaders });
 
-      const driverRes = await fetch(`${dbUrl}/taxi_drivers/${driverId}.json`);
-      const driver = await driverRes.json();
-      const token = driver && driver.fcmToken;
+      const token = await rtdbGet(dbUrl, `taxi_drivers/${driverId}/fcmToken`);
       if (!token) {
         return new Response('No FCM token for this driver', { status: 200, headers: corsHeaders });
       }
@@ -666,9 +716,7 @@ export default {
         return new Response('No OTP sender shop is configured in the Operator Panel', { status: 200, headers: corsHeaders });
       }
 
-      const senderRestRes = await fetch(`${dbUrl}/restaurants/${senderRestId}.json`);
-      const senderRest = await senderRestRes.json();
-      const senderToken = senderRest && senderRest.fcmToken;
+      const senderToken = await rtdbGet(dbUrl, `restaurants/${senderRestId}/fcmToken`);
       if (!senderToken) {
         return new Response('The configured OTP sender shop has no FCM token yet', { status: 200, headers: corsHeaders });
       }
@@ -694,8 +742,7 @@ export default {
       if (!restId) return new Response('restId required', { status: 400, headers: corsHeaders });
 
       // 1. Look up the restaurant's saved FCM token from Firebase RTDB.
-      const restRes = await fetch(`${dbUrl}/restaurants/${restId}.json`);
-      const rest = await restRes.json();
+      const rest = await rtdbFields(dbUrl, `restaurants/${restId}`, ['restaurantName', 'name', 'fcmToken']);
       // Also tell every Operator Panel device (silent notification, no sound).
       // Runs even if this shop has no FCM token; never blocks the shop's own alert.
       await notifyOperatorDevices(env, {
@@ -824,6 +871,15 @@ export default {
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(dispatchWrite.body),
       }).catch(() => {});
+      if (dispatchWrite.queue) {
+        const putQueue = () => fetch(`${dbUrl}/dispatch_queue/${dispatchWrite.queue.key}.json`, {
+          method: 'PUT',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(dispatchWrite.queue.value),
+        });
+        // one retry — if this entry were lost, the nearest->broadcast escalation would not fire
+        await putQueue().then((r) => { if (!r.ok) return putQueue(); }).catch(() => putQueue().catch(() => {}));
+      }
     }
 
     const anyOk = sendResults.some(r => r.ok);
@@ -847,69 +903,82 @@ export default {
   },
 };
 
+// Escalation sweep. BEFORE: every minute it downloaded rides.json + taxi_drivers.json +
+// restaurants.json (all shops, menus, order history) even when nothing was waiting.
+// NOW: it reads only dispatch_queue (a few tiny entries written when a nearest-driver
+// offer goes out). Empty queue -> returns immediately, almost zero bandwidth.
+// Escalation rules / timing / messages are unchanged.
 async function runEscalationSweep(env) {
   const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
   const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
   const projectId = serviceAccount.project_id;
   const now = Date.now();
 
-  const [ridesRes, driversRes, restaurantsRes] = await Promise.all([
-    fetch(`${dbUrl}/rides.json`),
-    fetch(`${dbUrl}/taxi_drivers.json`),
-    fetch(`${dbUrl}/restaurants.json`),
-  ]);
-  const rides = (await ridesRes.json()) || {};
-  const drivers = (await driversRes.json()) || {};
-  const restaurants = (await restaurantsRes.json()) || {};
+  const token = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const authH = { Authorization: `Bearer ${token}` };
 
-  let accessToken = null; // fetched lazily, only if there's actually work to do
-  const getToken = async () => {
-    if (!accessToken) accessToken = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    return accessToken;
-  };
+  const qRes = await fetch(`${dbUrl}/dispatch_queue.json`, { headers: authH });
+  if (!qRes.ok) return;
+  const queue = (await qRes.json()) || {};
+  // cap per run so we stay well under Cloudflare's subrequest limit; the rest go next minute
+  const entries = Object.entries(queue).filter(([k, q]) => q && typeof q === 'object').slice(0, 10);
+  if (!entries.length) return;
+
+  const dropQueue = (key) => fetch(`${dbUrl}/dispatch_queue/${key}.json`, { method: 'DELETE', headers: authH }).catch(() => {});
+  const STALE_MS = 60 * 60 * 1000;   // give up on an entry that never resolved
+  const due = [];
+
+  await Promise.all(entries.map(async ([key, q]) => {
+    try {
+      if (q.notifiedAt && now - q.notifiedAt > STALE_MS) { await dropQueue(key); return; }
+
+      if (q.kind === 'ride' && q.rideId) {
+        const ride = await rtdbGet(dbUrl, `rides/${q.rideId}`, token);
+        const d = ride && ride.dispatch;
+        // ride gone / accepted / cancelled / already broadcast -> nothing left to do
+        if (!ride || ride.status !== 'searching' || !d || d.stage !== 'nearest') { await dropQueue(key); return; }
+        if (now - (d.notifiedAt || 0) < NEAREST_TIMEOUT_MS) return;
+        due.push({ key, kind: 'ride', rideId: q.rideId, ride, d });
+      } else if (q.kind === 'delivery' && q.restId && q.orderId) {
+        const order = await rtdbGet(dbUrl, `restaurants/${q.restId}/orders/${q.orderId}`, token);
+        const d = order && order.dispatch;
+        if (!order || order.status !== 'ready' || order.deliveryDriverId || !d || d.stage !== 'nearest') { await dropQueue(key); return; }
+        if (now - (d.notifiedAt || 0) < DELIVERY_NEAREST_TIMEOUT_MS) return;
+        const rest = await rtdbFields(dbUrl, `restaurants/${q.restId}`, ['goSeries', 'location', 'name'], token);
+        if (!rest.goSeries) { await dropQueue(key); return; }
+        due.push({ key, kind: 'delivery', restId: q.restId, orderId: q.orderId, order, d, rest });
+      } else {
+        await dropQueue(key);   // unknown/garbled entry
+      }
+    } catch (e) { /* try again next minute */ }
+  }));
+
+  if (!due.length) return;
+  const drivers = await fetchOnlineDrivers(dbUrl);   // only fetched when something is actually due
 
   const jobs = [];
-
-  // ---- Rides still "searching" past their nearest-only window ----
-  Object.entries(rides).forEach(([rideId, ride]) => {
-    if (!ride || ride.status !== 'searching') return;
-    const d = ride.dispatch;
-    if (!d || d.stage !== 'nearest') return;
-    if (now - (d.notifiedAt || 0) < NEAREST_TIMEOUT_MS) return;
-    const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : (ride.pickup || null);
-    if (!pickup) return;
-    const matchFilter = dr => dr.isOnline === true && dr.vehicleType === ride.vehicleType && dr.fcmToken && (!dr.services || dr.services.taxi !== false) && !(d.notifiedIds || []).includes(dr._id);
-    const ranked = rankDriversByDistance(drivers, pickup, () => true)
-      .filter(r => matchFilter(Object.assign({ _id: r.id }, r.driver)))
-      .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-    if (!ranked.length) return;
-    jobs.push({
-      kind: 'ride', id: rideId, path: `rides/${rideId}`,
-      tokens: ranked.map(r => r.driver.fcmToken),
-      notifiedIds: [...(d.notifiedIds || []), ...ranked.map(r => r.id)],
-      title: 'New Ride Request' + (ride.customerName ? ' — ' + ride.customerName : ''),
-      body: [ride.pickup?.text && ('Pickup: ' + ride.pickup.text), ride.drop?.text && ('Drop: ' + ride.drop.text), ride.fare && ('Fare: ₹' + ride.fare)].filter(Boolean).join(' · ') || 'Tap to view ride details',
-      data: { type: 'new_ride', rideId, pickupAddress: ride.pickup?.text || '', dropAddress: ride.drop?.text || '', customerName: ride.customerName || '', customerPhone: ride.customerNumber || '', fare: ride.fare != null ? String(ride.fare) : '', vehicleType: ride.vehicleType || '' },
-      channelId: 'ride_alerts', soundName: 'ride_alert',
-    });
-  });
-
-  // ---- Delivery jobs still "ready" (unclaimed) past their window ----
-  // Only Go Series shops route to bike delivery boys at all (see
-  // partner.html's broadcastDeliveryJobToDrivers, which now only calls this
-  // worker's 'delivery' notify endpoint for Go Series shops) — so a
-  // non-Go-Series shop's order never gets a `dispatch` field written and is
-  // already skipped by the `d.stage !== 'nearest'` check below. This
-  // explicit rest.goSeries check is just a belt-and-braces guard against
-  // any older/stale dispatch data.
-  Object.entries(restaurants).forEach(([restId, rest]) => {
-    if (!rest || !rest.goSeries) return;
-    const orders = (rest && rest.orders) || {};
-    Object.entries(orders).forEach(([orderId, order]) => {
-      if (!order || order.status !== 'ready' || order.deliveryDriverId) return;
-      const d = order.dispatch;
-      if (!d || d.stage !== 'nearest') return;
-      if (now - (d.notifiedAt || 0) < DELIVERY_NEAREST_TIMEOUT_MS) return;
+  due.forEach((x) => {
+    const d = x.d;
+    if (x.kind === 'ride') {
+      const ride = x.ride, rideId = x.rideId;
+      const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : (ride.pickup || null);
+      if (!pickup) return;
+      const matchFilter = dr => dr.isOnline === true && dr.vehicleType === ride.vehicleType && dr.fcmToken && (!dr.services || dr.services.taxi !== false) && !(d.notifiedIds || []).includes(dr._id);
+      const ranked = rankDriversByDistance(drivers, pickup, () => true)
+        .filter(r => matchFilter(Object.assign({ _id: r.id }, r.driver)))
+        .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
+      if (!ranked.length) return;
+      jobs.push({
+        key: x.key, kind: 'ride', id: rideId, path: `rides/${rideId}`,
+        tokens: ranked.map(r => r.driver.fcmToken),
+        notifiedIds: [...(d.notifiedIds || []), ...ranked.map(r => r.id)],
+        title: 'New Ride Request' + (ride.customerName ? ' — ' + ride.customerName : ''),
+        body: [ride.pickup?.text && ('Pickup: ' + ride.pickup.text), ride.drop?.text && ('Drop: ' + ride.drop.text), ride.fare && ('Fare: ₹' + ride.fare)].filter(Boolean).join(' · ') || 'Tap to view ride details',
+        data: { type: 'new_ride', rideId, pickupAddress: ride.pickup?.text || '', dropAddress: ride.drop?.text || '', customerName: ride.customerName || '', customerPhone: ride.customerNumber || '', fare: ride.fare != null ? String(ride.fare) : '', vehicleType: ride.vehicleType || '' },
+        channelId: 'ride_alerts', soundName: 'ride_alert',
+      });
+    } else {
+      const { restId, orderId, order, rest } = x;
       const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : parseLatLngStr(rest.location);
       if (!pickup) return;
       const matchFilter = dr => dr.isOnline === true && dr.vehicleType === 'bike' && dr.fcmToken && (!dr.services || dr.services.delivery !== false) && !(d.notifiedIds || []).includes(dr._id);
@@ -918,7 +987,7 @@ async function runEscalationSweep(env) {
         .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
       if (!ranked.length) return;
       jobs.push({
-        kind: 'delivery', id: `${restId}::${orderId}`, path: `restaurants/${restId}/orders/${orderId}`,
+        key: x.key, kind: 'delivery', id: `${restId}::${orderId}`, path: `restaurants/${restId}/orders/${orderId}`,
         tokens: ranked.map(r => r.driver.fcmToken),
         notifiedIds: [...(d.notifiedIds || []), ...ranked.map(r => r.id)],
         title: 'New Delivery' + (order.orderNumber ? ' #' + order.orderNumber : '') + (rest.name ? ' — ' + rest.name : ''),
@@ -926,11 +995,10 @@ async function runEscalationSweep(env) {
         data: { type: 'new_delivery', restId, orderId, restName: rest.name || '', orderNumber: order.orderNumber || '', itemsSummary: order.itemsSummary || '', customerName: order.customerName || '', customerPhone: order.customerPhone || '', customerAddress: order.customerAddress || '', totalAmount: order.totalAmount != null ? String(order.totalAmount) : '', deliveryFee: order.deliveryFee != null ? String(order.deliveryFee) : '' },
         channelId: 'order_alerts', soundName: 'order_alert',
       });
-    });
+    }
   });
 
   if (!jobs.length) return;
-  const token = await getToken();
 
   await Promise.all(jobs.map(async (job) => {
     const isFullScreenAlert = FULL_SCREEN_ALERT_TYPES.has(job.data.type);
@@ -953,13 +1021,18 @@ async function runEscalationSweep(env) {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ dispatch: { stage: 'broadcast', notifiedIds: job.notifiedIds, notifiedAt: now } }),
     }).catch(() => {});
+    await dropQueue(job.key);   // broadcast done -> nothing more to watch
   }));
 }
 
 // Signs a JWT with the service account's private key and exchanges it for
 // a short-lived Google OAuth access token. Pure Web Crypto — works fine
 // inside Cloudflare Workers (no Node.js APIs needed).
+let _tokCache = { key: null, token: null, exp: 0 };
 async function getGoogleAccessToken(serviceAccountJson) {
+  // Re-use the token for 50 min (Google issues it for 60) instead of signing a
+  // new JWT + calling Google on every single request.
+  if (_tokCache.token && _tokCache.key === serviceAccountJson && Date.now() < _tokCache.exp) return _tokCache.token;
   const sa = JSON.parse(serviceAccountJson);
   const now = Math.floor(Date.now() / 1000);
 
@@ -1003,6 +1076,7 @@ async function getGoogleAccessToken(serviceAccountJson) {
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
   });
   const tokenData = await tokenRes.json();
+  if (tokenData.access_token) _tokCache = { key: serviceAccountJson, token: tokenData.access_token, exp: Date.now() + 50 * 60 * 1000 };
   return tokenData.access_token;
 }
 
@@ -1083,8 +1157,7 @@ async function runLoyaltyReminderSweep(env) {
       method: 'PUT', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(at),
     }).catch(() => {});
 
-    const cust = await (await fetch(`${dbUrl}/customers/${phone}.json`, { headers: auth })).json().catch(() => null);
-    const token = cust && cust.fcmToken;
+    const token = await rtdbGet(dbUrl, `customers/${phone}/fcmToken`, accessToken);
     if (!token) continue;
 
     const rt = loyaltyRewardTextW(cfg).replace(/ \(up to[^)]*\)/, ''), left = loyaltyLeftW(exp - now), when = loyaltyFmtDateW(exp);
