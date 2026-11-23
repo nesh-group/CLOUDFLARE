@@ -22,6 +22,12 @@
 // ONLY this file — do not deploy driver_index.js or partner_index.js.
 // ---------------------------------------------------------------------
 //
+// EXACT-TIME ROTATION (optional, recommended): add a Durable Object so the next driver is rung exactly when his
+// turn starts instead of at the next 1-minute cron tick. Dashboard: this Worker -> Settings -> Bindings -> Add ->
+// Durable Object -> Variable name JOB_TICKER, Class JobTimer (SQLite). With wrangler instead:
+//   [[durable_objects.bindings]]  name = "JOB_TICKER"  class_name = "JobTimer"
+//   [[migrations]]  tag = "v1"  new_sqlite_classes = ["JobTimer"]
+// Without the binding everything still works (cron only, up to 60 s later per driver). Keep the Cron Trigger either way.
 // CLOUDFLARE WORKER — sends order-alert AND ride-alert push notifications,
 // with Uber-style NEAREST-DRIVER-FIRST dispatch for rides + deliveries.
 //
@@ -97,10 +103,13 @@
 // minute-level granularity (see `scheduled` below), not this constant.
 // Applies to taxi rides.
 const NEAREST_TIMEOUT_MS = 25 * 1000;
+// Free-plan Workers allow 50 subrequests per invocation and every push is one fetch.
+// Cap pushes per invocation (nearest drivers first) so the rest never silently fail.
+const MAX_FCM_SENDS = 40;
 // Same idea, but for Go Series delivery jobs specifically — kept separate
 // so delivery's nearest-only window can be tuned without touching taxi
 // rides. Mirrors DELIVERY_NEAREST_WINDOW_MS in driver.html.
-const DELIVERY_NEAREST_TIMEOUT_MS = 2 * 60 * 1000;
+const DELIVERY_NEAREST_TIMEOUT_MS = 45 * 1000;   // = DELIVERY_NEAREST_WINDOW_MS in driver.html (keep equal!)
 // Radius used both for picking the nearest driver and (mainly) for the
 // broadcast fallback — drivers further than this are assumed too far to
 // bother alerting.
@@ -192,31 +201,370 @@ async function driverTokensFor(dbUrl, ids) {
     const toks = await Promise.all(ids.map((id) => rtdbGet(dbUrl, `taxi_drivers/${id}/fcmToken`)));
     return toks.filter(Boolean);
   }
-  const r = await fetch(`${dbUrl}/taxi_drivers.json`);
-  const drivers = (await r.json()) || {};
+  // Many ids -> ONE read of ONLINE drivers only (indexed query) instead of every driver ever
+  // registered: far less JSON to parse, so it stays under the 10 ms CPU limit. A driver who has
+  // since gone offline is not ringing anyway. (Falls back to the full read if the index is missing.)
+  const drivers = await fetchOnlineDrivers(dbUrl);
   return ids.map((id) => drivers[id] && drivers[id].fcmToken).filter(Boolean);
 }
 
-// Ranks online, matching drivers by distance to a pickup point. Drivers
-// with no location, or a location older than LOCATION_STALE_MS, are
-// excluded from ranking (we simply don't know where they are).
-function rankDriversByDistance(drivers, pickup, filterFn) {
-  const now = Date.now();
-  return Object.entries(drivers)
-    .filter(([id, d]) => d && filterFn(d))
-    .map(([id, d]) => {
-      const loc = d.location;
-      const hasFreshLoc = loc && typeof loc.lat === 'number' && typeof loc.lng === 'number' &&
-        loc.updatedAt && (now - loc.updatedAt) < LOCATION_STALE_MS;
-      const distanceKm = hasFreshLoc ? haversineKm(pickup.lat, pickup.lng, loc.lat, loc.lng) : null;
-      return { id, driver: d, distanceKm };
-    })
-    .sort((a, b) => {
-      if (a.distanceKm == null && b.distanceKm == null) return 0;
-      if (a.distanceKm == null) return 1;
-      if (b.distanceKm == null) return -1;
-      return a.distanceKm - b.distanceKm;
+// ---------------------------------------------------------------------
+// DRIVER POPUP PAYLOAD + FCM SAFETY (added)
+//  * strData(): FCM data values MUST all be strings. A single number (e.g. an
+//    orderNumber stored as a number) makes FCM reject the WHOLE message with
+//    400, so the alert silently never arrives. Every data map is run through
+//    this right before sending.
+//  * addPopupPayload(): adds ONE extra data field `payload` = JSON with the
+//    fields the driver popup shows (fare, pickup, drop, items ...), so the
+//    native app can show the full card instantly. Kept under the 4 KB FCM
+//    limit: if it does not fit it is trimmed, and if it still does not fit it
+//    is simply left out (the alert itself is never affected).
+// ---------------------------------------------------------------------
+const _utf8 = new TextEncoder();
+function byteLen(s) { return _utf8.encode(String(s == null ? '' : s)).length; }
+function strData(o) {
+  const out = {};
+  for (const k of Object.keys(o || {})) {
+    const v = o[k];
+    out[k] = v == null ? '' : (typeof v === 'string' ? v : String(v));
+  }
+  return out;
+}
+function pStr(v, max) { if (v == null) return undefined; const t = String(v).trim(); return t ? t.slice(0, max || 160) : undefined; }
+function pNum(v) { if (v == null || v === '') return undefined; const n = Number(v); return Number.isFinite(n) ? n : undefined; }
+function pClean(o) { const out = {}; for (const k of Object.keys(o)) if (o[k] !== undefined) out[k] = o[k]; return out; }
+
+// Same key names driver.html reads: item.pickup.text, item.drop.text, item.fare,
+// item.distanceKm, item.vehicleType, item.customerName.
+function buildRidePayload(ride, b) {
+  const r = ride || {}, x = b || {};
+  const pk = r.pickup || {}, dp = r.drop || {};
+  const loc = (o, text, lat, lng) => pClean({
+    text: pStr(o.text != null ? o.text : text, 200),
+    lat: pNum(o.lat != null ? o.lat : lat),
+    lng: pNum(o.lng != null ? o.lng : lng),
+  });
+  return pClean({
+    vehicleType: pStr(r.vehicleType || x.vehicleType, 30),
+    fare: pNum(r.fare != null ? r.fare : x.fare),
+    distanceKm: pNum(r.distanceKm != null ? r.distanceKm : x.distanceKm),
+    customerName: pStr(r.customerName || x.customerName, 60),
+    pickup: loc(pk, x.pickupAddress, x.pickupLat, x.pickupLng),
+    drop: loc(dp, x.dropAddress, x.dropLat, x.dropLng),
+  });
+}
+// Same key names driver.html reads for a delivery card (deliveryPayout,
+// deliveryLocationsHtml, deliveryInstrHtml, items list).
+function buildDeliveryPayload(order, rest, b) {
+  const o = order || {}, r = rest || {}, x = b || {};
+  const raw = o.items;
+  const arr = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : []);
+  const items = arr.filter((it) => it && it.name != null).slice(0, 12)
+    .map((it) => ({ qty: pNum(it.qty) != null ? pNum(it.qty) : 1, name: pStr(it.name, 40) || '' }));
+  const instr = Array.isArray(o.deliveryInstructions)
+    ? o.deliveryInstructions.filter(Boolean).slice(0, 6).map((t) => pStr(t, 80)).filter(Boolean) : [];
+  return pClean({
+    orderNumber: pStr(o.orderNumber != null ? o.orderNumber : x.orderNumber, 30),
+    deliveryFee: pNum(o.deliveryFee != null ? o.deliveryFee : x.deliveryFee),
+    deliveryFeeWaived: pNum(o.deliveryFeeWaived),
+    rainSurgeDriver: pNum(o.rainSurgeDriver),
+    tip: pNum(o.tip),
+    customerName: pStr(o.customerName || x.customerName, 60),
+    customerPhone: pStr(o.customerPhone || x.customerPhone, 20),
+    customerLat: pNum(o.customerLat),
+    customerLng: pNum(o.customerLng),
+    customerPlace: pStr(o.customerPlace, 120),
+    customerAddress: pStr(o.customerAddress || x.customerAddress, 200),
+    customerLocation: pStr(o.customerLocation, 120),
+    customerLandmark: pStr(o.customerLandmark, 80),
+    deliveryDirections: pStr(o.deliveryDirections, 120),
+    deliveryInstructions: instr.length ? instr : undefined,
+    items: items.length ? items : undefined,
+    _restName: pStr(r.restaurantName || r.name || x.restName, 80),
+    _restAddress: pStr(r.address, 160),
+    _restLocation: pStr(r.location, 40),
+    _restPhone: pStr(r.phone, 20),
+  });
+}
+function addPopupPayload(data, title, body, obj) {
+  try {
+    if (!obj || !Object.keys(obj).length) return data;
+    const probe = Object.assign({}, strData(data), { title: String(title == null ? '' : title), body: String(body == null ? '' : body) });
+    const maxBytes = 3500 - byteLen(JSON.stringify(probe));   // FCM limit is 4096 bytes in total; keep headroom
+    const o2 = Object.assign({}, obj);
+    if (Array.isArray(o2.items)) o2.items = o2.items.slice(0, 6).map((i) => ({ qty: i.qty, name: String(i.name).slice(0, 20) }));
+    if (Array.isArray(o2.deliveryInstructions)) o2.deliveryInstructions = o2.deliveryInstructions.slice(0, 3);
+    const o3 = Object.assign({}, o2);
+    delete o3.items; delete o3.deliveryInstructions; delete o3.deliveryDirections; delete o3.customerLandmark;
+    for (const a of [obj, o2, o3]) {
+      const str = JSON.stringify(a);
+      if (byteLen(JSON.stringify(str)) <= maxBytes) { data.payload = str; break; }   // escaped length = conservative
+    }
+  } catch (e) { /* payload is optional - never break the alert */ }
+  return data;
+}
+
+// ---------------------------------------------------------------------
+// ZONE FILTER (mirrors driver.html's zoneForPickup / zoneMatchSet): a pickup inside a drawn
+// driver_zones boundary is only offered to drivers registered to that zone (delivery also to
+// the other zones of the same group). Pickup outside every zone, no zones drawn, or any read
+// error -> null = no zone restriction (the old plain-radius behaviour), so nothing can strand.
+// driver_zones is tiny and rarely changes, so it is cached 5 min per worker instance.
+// ---------------------------------------------------------------------
+let _zonesCache = { at: 0, zones: null };
+async function getZones(dbUrl) {
+  if (_zonesCache.zones && Date.now() - _zonesCache.at < 5 * 60 * 1000) return _zonesCache.zones;
+  const v = await rtdbGet(dbUrl, 'driver_zones');
+  if (!v || typeof v !== 'object') return null;
+  const zones = Object.entries(v).filter(([id, z]) => z && typeof z === 'object').map(([id, z]) => {
+    const b = Array.isArray(z.bounds) ? z.bounds : (z.bounds && typeof z.bounds === 'object' ? Object.values(z.bounds) : []);
+    return { _id: id, groupId: z.groupId || null, bounds: b.filter(p => p && typeof p.lat === 'number' && typeof p.lng === 'number') };
+  });
+  _zonesCache = { at: Date.now(), zones };
+  return zones;
+}
+function pointInBounds(pt, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].lng, yi = poly[i].lat, xj = poly[j].lng, yj = poly[j].lat;
+    if (((yi > pt.lat) !== (yj > pt.lat)) && (pt.lng < (xj - xi) * (pt.lat - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+// Returns a filter function for drivers (d => in the pickup's zone), or null when there is no restriction.
+async function zoneFilterFor(dbUrl, pickup, useGroup) {
+  try {
+    if (!pickup || typeof pickup.lat !== 'number' || typeof pickup.lng !== 'number') return null;
+    const zones = await getZones(dbUrl);
+    if (!zones) return null;
+    const hit = zones.find(z => z.bounds.length >= 3 && pointInBounds(pickup, z.bounds));
+    if (!hit) return null;
+    const set = new Set([hit._id]);
+    if (useGroup && hit.groupId) zones.forEach(z => { if (z.groupId === hit.groupId) set.add(z._id); });
+    return d => set.has(d.zone);
+  } catch (e) { return null; }
+}
+
+// ---- ORACLE DISPATCH SWITCH: when the server (dispatch.js) owns a job's zone, the Worker does nothing ----
+// app_config/oracleDispatch = "zoneA,zoneB" | true | absent. oracleDispatchBeat = ms, written by the server every 30 s.
+// If the beat is older than 90 s the server is considered down and the Worker keeps working as before.
+let _oc = { at: 0, cfg: null, beat: 0 };
+async function oracleCovers(dbUrl, getPickup, useGroup) {
+  try {
+    if (Date.now() - _oc.at > 60000) {
+      const [cfg, beat] = await Promise.all([rtdbGet(dbUrl, 'app_config/oracleDispatch'), rtdbGet(dbUrl, 'app_config/oracleDispatchBeat')]);
+      _oc = { at: Date.now(), cfg, beat: Number(beat) || 0 };
+    }
+    const cfg = _oc.cfg;
+    if (!cfg) return false;
+    if (_oc.at - _oc.beat > 90000) return false;                 // server silent -> Worker takes over
+    if (cfg === true || cfg === 'true') return true;
+    const pickup = await getPickup();
+    if (!pickup) return false;
+    const zones = await getZones(dbUrl);
+    const hit = zones && zones.find(z => z.bounds.length >= 3 && pointInBounds(pickup, z.bounds));
+    if (!hit) return false;
+    return String(cfg).split(',').map(s => s.trim()).includes(hit._id);
+  } catch (e) { return false; }
+}
+const ORACLE_SKIP = (corsHeaders) => new Response(JSON.stringify({ skipped: 'oracle' }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+
+// =====================================================================
+// MATCHING — MIRRORS driver.html (shouldOfferToMe / candidatesInZone / rankAmongCandidates / rankPool)
+// so the driver the push rings is always the driver the app is showing the job to at that moment.
+//   * candidates: online + vehicle/service match + zone (+group for delivery) + fresh location + within radius
+//   * free drivers first; busy drivers only when nobody free exists
+//   * order: nearest first (road km for the shortlist, straight-line for the rest); drivers within
+//     NEAR_OVERRIDE_KM of the nearest are ordered by fewest orders today -> longest online -> stable hash
+//   * rotation: turn = floor(elapsed / window); after (total+1) windows everybody sees the job
+// KEEP THESE CONSTANTS EQUAL TO driver.html (NEAREST_WINDOW_MS, DELIVERY_NEAREST_WINDOW_MS, NEAR_OVERRIDE_KM,
+// MAX_MATCH_RADIUS_KM, LOCATION_STALE_MS, ROAD_SHORTLIST, ROAD_SKIP_RATIO).
+// =====================================================================
+const NEAR_OVERRIDE_KM = 0.5;
+const todayKeyIST = () => new Date(Date.now() + 19800000).toISOString().slice(0, 10);   // YYYY-MM-DD, India time (same as the driver phones' todayKey)
+function orderCountOf(d) { const rc = d && d.rideCountToday; return rc && rc.date === todayKeyIST() ? (rc.count || 0) : 0; }
+function onlineSinceOf(d) { return (d && d.onlineSince) || Infinity; }
+function stableKey(createdAt, driverId) {
+  const str = String(createdAt || 0) + '|' + String(driverId || '');
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+  return h;
+}
+function rankPoolW(list, createdAt) {   // items carry rk = the distance used for ranking
+  const by = list.slice().sort((a, b) => a.rk - b.rk);
+  if (!by.length) return [];
+  const min = by[0].rk;
+  const cluster = by.filter(c => c.rk - min <= NEAR_OVERRIDE_KM);
+  const rest = by.filter(c => c.rk - min > NEAR_OVERRIDE_KM);
+  cluster.sort((a, b) => {
+    const cd = orderCountOf(a.driver) - orderCountOf(b.driver);
+    if (cd !== 0) return cd;
+    const oa = onlineSinceOf(a.driver), ob = onlineSinceOf(b.driver);   // Infinity - Infinity = NaN, so compare instead of subtract
+    if (oa !== ob) return oa < ob ? -1 : 1;
+    return stableKey(createdAt, a.id) - stableKey(createdAt, b.id);
+  });
+  return [...cluster, ...rest];
+}
+function rankW(cands, createdAt, road) {
+  const base = cands.map(c => Object.assign({}, c, { rk: c.distanceKm }));
+  if (road && typeof road === 'object') {
+    const withRoad = [], without = [];
+    base.forEach(c => {
+      const rk = road[c.id];
+      if (typeof rk === 'number' && isFinite(rk) && rk >= 0) withRoad.push(Object.assign({}, c, { rk })); else without.push(c);
     });
+    return [...rankPoolW(withRoad, createdAt), ...rankPoolW(without, createdAt)];
+  }
+  return rankPoolW(base, createdAt);
+}
+function candidatesW(drivers, pickup, matchFn, zoneFn, includeBusy) {
+  const now = Date.now(), out = [];
+  Object.entries(drivers || {}).forEach(([id, d]) => {
+    if (!d || !matchFn(d)) return;
+    if (d.isBusy && !includeBusy) return;
+    if (zoneFn && !zoneFn(d)) return;
+    const loc = d.location;
+    if (!loc || typeof loc.lat !== 'number' || typeof loc.lng !== 'number' || !loc.updatedAt) return;
+    if (now - loc.updatedAt > LOCATION_STALE_MS) return;
+    const distanceKm = haversineKm(pickup.lat, pickup.lng, loc.lat, loc.lng);
+    if (distanceKm > MAX_MATCH_RADIUS_KM) return;
+    out.push({ id, driver: d, distanceKm });
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// ROAD KM (same route Worker + request shape as driver.html's ROAD_RANKING).
+// The answer is also written to <job>/roadKm in EXACTLY the shape driver.html writes
+// ({status:'ok'|'skip'|'failed'|'pending', by, at, km:{driverId:km}, round:0}), so the phones read it and do NOT
+// ask the route Worker again -> one ORS request per job. First writer wins through a conditional write
+// (Firebase `if-match: null_etag`): if a phone already claimed the job, this Worker just ranks without road km.
+// Any failure -> null -> straight-line ranking (same as the app's fallback).
+// ---------------------------------------------------------------------
+const ROAD_WORKER_URL = 'https://route-worker.neshgroup1.workers.dev';
+const ROAD_SHORTLIST = 5;        // = ROAD_SHORTLIST in driver.html
+const ROAD_MIN_CANDIDATES = 2;   // = ROAD_MIN_CANDIDATES
+const ROAD_SKIP_RATIO = 2.5;     // = ROAD_SKIP_RATIO
+const ROAD_FETCH_TIMEOUT_MS = 4000;   // must stay below ROAD_WAIT_MS (6000) in driver.html
+async function roadClaim(dbUrl, token, path, value) {
+  try {
+    const r = await fetch(`${dbUrl}/${path}/roadKm.json`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'if-match': 'null_etag' },
+      body: JSON.stringify(value),
+    });
+    return r.ok;   // 412 = already exists
+  } catch (e) { return false; }
+}
+async function roadSet(dbUrl, token, path, value) {
+  try {
+    await fetch(`${dbUrl}/${path}/roadKm.json`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(value),
+    });
+  } catch (e) { /* phones fall back to their own request / straight-line */ }
+}
+// pool = candidates sorted nearest-first (free drivers, else busy). ctx = { env, dbUrl, path, nodeExists }.
+async function roadKmFor(pool, pickup, ctx) {
+  try {
+    if (pool.length < ROAD_MIN_CANDIDATES) return null;
+    const canWrite = !!(ctx && ctx.path && ctx.nodeExists && ctx.env && ctx.dbUrl);
+    let token = null;
+    if (canWrite) { try { token = await getGoogleAccessToken(ctx.env.FIREBASE_SERVICE_ACCOUNT_JSON); } catch (e) { token = null; } }
+    const write = !!token;
+    const at = Date.now();
+    if (ROAD_SKIP_RATIO > 0 && pool[1].distanceKm > ROAD_SKIP_RATIO * pool[0].distanceKm) {
+      if (write) await roadClaim(ctx.dbUrl, token, ctx.path, { status: 'skip', by: 'worker', at, round: 0 });
+      return null;
+    }
+    const shortlist = pool.slice(0, ROAD_SHORTLIST);
+    const owned = write ? await roadClaim(ctx.dbUrl, token, ctx.path, { status: 'pending', by: 'worker', at, round: 0 }) : false;
+    let km = null;
+    try {
+      const drivers = shortlist.map(r => ({ id: r.id, lat: r.driver.location.lat, lng: r.driver.location.lng }));
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), ROAD_FETCH_TIMEOUT_MS);
+      try {
+        const resp = await fetch(ROAD_WORKER_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pickup: { lat: pickup.lat, lng: pickup.lng }, drivers }),
+          signal: ctl.signal,
+        });
+        if (resp.ok) km = ((await resp.json()) || {}).km || null;
+      } finally { clearTimeout(t); }
+    } catch (e) { km = null; }
+    const clean = {};
+    if (km) shortlist.forEach(r => { const v = km[r.id]; if (typeof v === 'number' && isFinite(v) && v >= 0) clean[r.id] = Math.round(v * 1000) / 1000; });
+    const have = Object.keys(clean).length;
+    if (owned) {
+      await roadSet(ctx.dbUrl, token, ctx.path, have
+        ? { status: 'ok', by: 'worker', at, km: clean, round: 0 }
+        : { status: 'failed', by: 'worker', at, round: 0 });
+    }
+    return have ? clean : null;
+  } catch (e) { return null; }
+}
+// The road km the phones agreed on (or null) — read from the job node.
+function roadOf(node) {
+  const rk = node && node.roadKm;
+  return (rk && rk.status === 'ok' && rk.km && typeof rk.km === 'object') ? rk.km : null;
+}
+
+// Ranked pool + whose turn it is. road === undefined && ctx -> fetch/claim road km now (job creation);
+// road === null / object -> use as is (cron). zoneFn may be null (= no zone restriction).
+async function matchJob({ drivers, pickup, matchFn, zoneFn, createdAt, windowMs, road, ctx }) {
+  let cands = candidatesW(drivers, pickup, matchFn, zoneFn, false);
+  let busyPool = false;
+  if (!cands.length) { cands = candidatesW(drivers, pickup, matchFn, zoneFn, true); busyPool = cands.length > 0; }   // nobody free -> busy drivers of the same zone
+  if (!cands.length) return { pool: [], total: 0, turn: 0, open: false, road: null, busyPool: false };
+  if (road === undefined && ctx) road = await roadKmFor(cands.slice().sort((a, b) => a.distanceKm - b.distanceKm), pickup, ctx);
+  const pool = rankW(cands, createdAt, road || null);
+  const total = pool.length;
+  const elapsed = Math.max(0, Date.now() - (createdAt || 0));
+  const turn = Math.min(Math.floor(elapsed / windowMs), total - 1);
+  const open = elapsed >= (total + 1) * windowMs;   // whole rotation has run: everybody sees it (app: OFFER_OPEN_AFTER_CYCLE)
+  return { pool, total, turn, open, road: road || null, busyPool };
+}
+// ---------------------------------------------------------------------
+// FROZEN POOL (bandwidth fix). When a job is first offered, the ranked driver order is written into the job
+// (dispatch.pool = [driverId, ...] nearest-first, dispatch.poolBusy = true when it was built from busy drivers).
+// Every driver phone then reads THAT list and only needs the clock to know whose turn it is - it no longer streams
+// every other driver's live GPS location while a job is open (that was N x N downloads). The cron below uses the same
+// list, so the phone that shows the job and the push that rings are still the same driver.
+// ---------------------------------------------------------------------
+const POOL_MAX = 60;   // = nobody beyond the 60 nearest is rung one-by-one; they see the job when the rotation opens
+function poolFields(m) {
+  return { pool: m.pool.slice(0, POOL_MAX).map((r) => r.id), poolBusy: !!m.busyPool };
+}
+// Same shape as matchJob's result, built from the stored pool. Drivers who went offline (or became busy while the pool
+// was free-only) are skipped - the phones apply the same rule from their own cache. null = this job has no stored pool.
+function poolMatch(d, drivers, createdAt, windowMs) {
+  const raw = d && (Array.isArray(d.pool) ? d.pool : (d.pool && typeof d.pool === 'object' ? Object.values(d.pool) : null));
+  if (!raw || !raw.length) return null;
+  const list = raw.filter((id) => { const dr = drivers[id]; return dr && dr.isOnline === true && (d.poolBusy || !dr.isBusy); })
+    .map((id) => ({ id, driver: drivers[id], distanceKm: null }));
+  if (!list.length) return { pool: [], total: 0, turn: 0, open: false, road: null };
+  const total = list.length;
+  const elapsed = Math.max(0, Date.now() - (createdAt || 0));
+  const turn = Math.min(Math.floor(elapsed / windowMs), total - 1);
+  return { pool: list, total, turn, open: elapsed >= (total + 1) * windowMs, road: null };
+}
+// Who to ring now: the driver whose turn it is (if not rung already) — or everyone not yet rung once the rotation is over.
+function selectTargets(m, d) {
+  const n = d && d.notifiedIds;
+  const notified = Array.isArray(n) ? n : (n && typeof n === 'object' ? Object.values(n) : []);
+  if (m.open) return { targets: m.pool.filter(r => !notified.includes(r.id)), fin: true };
+  const cur = m.pool[m.turn];
+  return { targets: cur && !notified.includes(cur.id) ? [cur] : [], fin: false };
+}
+async function persistDispatchNow(env, dbUrl, dw) {   // used when the driver whose turn it is has no push token
+  try {
+    const t = await getGoogleAccessToken(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    const h = { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' };
+    await fetch(`${dbUrl}/${dw.path}.json`, { method: 'PATCH', headers: h, body: JSON.stringify(dw.body) });
+    if (dw.queue) await fetch(`${dbUrl}/dispatch_queue/${dw.queue.key}.json`, { method: 'PUT', headers: h, body: JSON.stringify(dw.queue.value) });
+  } catch (e) { /* cron will pick the job up via its own queue entry next time it is written */ }
 }
 
 // Alerts every device that has opened the Operator Panel (operator_devices/{key}).
@@ -425,6 +773,7 @@ export default {
         if (restToken) targetTokens = [restToken];
       }
 
+      targetTokens = targetTokens.slice(0, MAX_FCM_SENDS);
       if (!targetTokens.length) {
         return new Response(JSON.stringify({ ok: true, sent: 0 }), {
           status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -466,6 +815,11 @@ export default {
     // Trigger's `scheduled` handler reads this back to decide when to
     // widen from "nearest driver only" to a full broadcast.
     let dispatchWrite = null; // { path, body }
+    let retryPool = [];       // (unused now: the next driver is rung when its turn comes, like the app shows it)
+    let rotating = false;     // true = one driver at a time, in the app's rotation order
+    let armAt = null;         // when the exact-time ticker should wake for this job's next turn
+    let nearestTimeoutMs = NEAREST_TIMEOUT_MS;
+    let srcNodeFound = false; // the ride / order node really exists (so a dispatch write never creates a stub node)
     let operatorKeyByToken = null; // filled for 'operator' alerts so dead tokens can be cleaned up
 
     if (notifType === 'ride') {
@@ -486,6 +840,9 @@ export default {
                   // the Choice Driver flow has its own 25s timeout that
                   // clears chosenDriverId, it never widens to other drivers.
       } = body;
+      // Ride node is read in parallel with the driver lookups below; it has the exact
+      // pickup/drop/fare/distance for the popup payload. Never throws (null on failure).
+      const rideNodeP = rideId ? rtdbGet(dbUrl, `rides/${rideId}`) : Promise.resolve(null);
 
       if (driverId) {
         const driverTok = await rtdbGet(dbUrl, `taxi_drivers/${driverId}/fcmToken`);
@@ -493,38 +850,68 @@ export default {
         if (!tokens.length) {
           return new Response('No FCM token for this driver', { status: 200, headers: corsHeaders });
         }
+        // Remember who was rung, so cancel_ring can find this driver (it reads dispatch.notifiedIds).
+        if (rideId) dispatchWrite = {
+          path: `rides/${rideId}`,
+          body: { dispatch: { stage: 'chosen', notifiedIds: [driverId], notifiedAt: Date.now() } },
+          union: true, needsNode: true,
+        };
       } else {
         if (!vehicleType) return new Response('vehicleType required', { status: 400, headers: corsHeaders });
+        if (await oracleCovers(dbUrl, async () => (typeof pickupLat === 'number' && typeof pickupLng === 'number') ? { lat: pickupLat, lng: pickupLng } : null, false)) return ORACLE_SKIP(corsHeaders);
 
         const drivers = await fetchOnlineDrivers(dbUrl);
-        const matchFilter = d => d.isOnline === true && d.vehicleType === vehicleType && d.fcmToken && (!d.services || d.services.taxi !== false);
+        const havePickup = typeof pickupLat === 'number' && typeof pickupLng === 'number';
+        const inZoneR = (havePickup && await zoneFilterFor(dbUrl, { lat: pickupLat, lng: pickupLng }, false)) || (() => true);
+        const matchFilter = d => d.isOnline === true && d.vehicleType === vehicleType && d.fcmToken && (!d.services || d.services.taxi !== false) && inZoneR(d);
 
         let chosen; // array of { id, driver, distanceKm }
-        const havePickup = typeof pickupLat === 'number' && typeof pickupLng === 'number';
+        let poolInfo = null;   // frozen driver order, written into rides/{id}/dispatch
+        let rideNodeExists = false;
+        const rideMatch = d => d.isOnline === true && d.vehicleType === vehicleType && (!d.services || d.services.taxi !== false);
         if (havePickup) {
-          const ranked = rankDriversByDistance(drivers, { lat: pickupLat, lng: pickupLng }, matchFilter);
-          const withinRadius = ranked.filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-          // Nearest driver with a known fresh location — if nobody has a
-          // location on file yet, fall back to the old broadcast-to-all
-          // behaviour so this never silently strands a ride.
-          const nearest = withinRadius.find(r => r.distanceKm != null);
-          chosen = nearest ? [nearest] : withinRadius;
+          const rideNodeEarly = rideId ? await rideNodeP : null;   // same promise read again below; never throws
+          rideNodeExists = !!rideNodeEarly;
+          const rideCreatedAt = (rideNodeEarly && rideNodeEarly.createdAt) || Date.now();
+          const m = await matchJob({ drivers, pickup: { lat: pickupLat, lng: pickupLng }, matchFn: rideMatch, zoneFn: inZoneR,
+            createdAt: rideCreatedAt, windowMs: NEAREST_TIMEOUT_MS,
+            ctx: { env, dbUrl, path: rideId ? `rides/${rideId}` : null, nodeExists: !!rideNodeEarly } });
+          if (m.pool.length) {
+            chosen = m.open ? m.pool : [m.pool[m.turn]];
+            rotating = !m.open;
+            if (!m.open) { armAt = nextBoundaryAt(m, rideCreatedAt, NEAREST_TIMEOUT_MS); poolInfo = poolFields(m); }
+          } else {
+            // nobody has a fresh location on file -> old behaviour: ring everyone who matches (never strands a ride)
+            chosen = Object.entries(drivers).filter(([id, d]) => d && rideMatch(d) && d.fcmToken && inZoneR(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
+          }
         } else {
-          chosen = Object.entries(drivers).filter(([id, d]) => d && matchFilter(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
+          chosen = Object.entries(drivers).filter(([id, d]) => d && rideMatch(d) && d.fcmToken && inZoneR(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
         }
+
+        chosen = chosen.slice(0, MAX_FCM_SENDS);   // nearest-first already; stay under subrequest limit
 
         tokens = chosen.map(c => c.driver.fcmToken).filter(Boolean);
-        if (!tokens.length) {
-          return new Response('No online drivers with a token for this vehicle type', { status: 200, headers: corsHeaders });
-        }
 
-        if (rideId && havePickup && chosen.length === 1 && chosen[0].distanceKm != null) {
+        if (rideId && havePickup && rotating) {
           dispatchWrite = {
             path: `rides/${rideId}`,
-            body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat, pickupLng } },
+            body: { dispatch: Object.assign({ stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat, pickupLng }, poolInfo || {}) },
             // tiny "to-do" entry so the Cron sweep never has to scan every ride/restaurant
             queue: { key: 'r_' + rideId, value: { kind: 'ride', rideId, notifiedAt: Date.now() } },
+            nearest: true,
           };
+        } else if (rideId) {
+          // Broadcast / fallback case: still record who was rung so cancel_ring can stop them.
+          dispatchWrite = {
+            path: `rides/${rideId}`,
+            body: { dispatch: { stage: 'broadcast', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now() } },
+            union: true, needsNode: true,
+          };
+        }
+        if (!tokens.length) {
+          // The driver whose turn it is has no push token: nothing to ring, but keep the rotation going (cron).
+          if (dispatchWrite && dispatchWrite.nearest && rideNodeExists) { await persistDispatchNow(env, dbUrl, dispatchWrite); await armTicker(env, armAt); }
+          return new Response('No push token for the driver whose turn it is', { status: 200, headers: corsHeaders });
         }
       }
 
@@ -547,6 +934,9 @@ export default {
         fare: fare != null ? String(fare) : '',
         vehicleType: vehicleType || '',
       };
+      const rideNode = await rideNodeP;
+      srcNodeFound = !!rideNode;
+      addPopupPayload(dataPayload, notifTitle, notifBody, buildRidePayload(rideNode, body));
 
       channelId = 'ride_alerts';
       soundName = 'ride_alert';
@@ -569,10 +959,13 @@ export default {
         deliveryFee,
       } = body;
       if (!restId || !orderId) return new Response('restId and orderId required', { status: 400, headers: corsHeaders });
+      if (await oracleCovers(dbUrl, async () => parseLatLngStr(await rtdbGet(dbUrl, `restaurants/${restId}/location`)), true)) return ORACLE_SKIP(corsHeaders);
 
-      const [drivers, rest] = await Promise.all([
+      nearestTimeoutMs = DELIVERY_NEAREST_TIMEOUT_MS;
+      const [drivers, rest, orderNode] = await Promise.all([
         fetchOnlineDrivers(dbUrl),
-        rtdbFields(dbUrl, `restaurants/${restId}`, ['goSeries', 'location']),
+        rtdbFields(dbUrl, `restaurants/${restId}`, ['goSeries', 'location', 'restaurantName', 'name', 'address', 'phone']),
+        rtdbGet(dbUrl, `restaurants/${restId}/orders/${orderId}`),   // exact fields for the popup payload
       ]);
       // Only Go Series shops (Operator Panel → Go Series) route orders to
       // bike delivery boys — every other shop arranges its own delivery, so
@@ -585,29 +978,52 @@ export default {
       const pickup = parseLatLngStr(rest.location);
       // Bike drivers only — matches driver.html's driverDoesDelivery(): auto/cab
       // drivers never see delivery jobs in the app, so never ring them either.
-      const matchFilter = d => d.isOnline === true && d.vehicleType === 'bike' && d.fcmToken && (!d.services || d.services.delivery !== false);
+      const inZoneD = (pickup && await zoneFilterFor(dbUrl, pickup, true)) || (() => true);
+      const deliveryMatch = d => d.isOnline === true && d.vehicleType === 'bike' && (!d.services || d.services.delivery !== false);
 
       let chosen;
+      let poolInfoD = null;   // frozen driver order, written into the order's dispatch
+      let rotatingD = false;
       if (pickup) {
-        const ranked = rankDriversByDistance(drivers, pickup, matchFilter);
-        const withinRadius = ranked.filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-        const nearest = withinRadius.find(r => r.distanceKm != null);
-        chosen = nearest ? [nearest] : withinRadius;
+        // Rotation clock = the order's createdAt, exactly as driver.html's shouldOfferToMe uses o.createdAt.
+        const m = await matchJob({ drivers, pickup, matchFn: deliveryMatch, zoneFn: inZoneD,
+          createdAt: (orderNode && orderNode.createdAt) || Date.now(), windowMs: DELIVERY_NEAREST_TIMEOUT_MS,
+          ctx: { env, dbUrl, path: `restaurants/${restId}/orders/${orderId}`, nodeExists: !!orderNode } });
+        if (m.pool.length) {
+          chosen = m.open ? m.pool : [m.pool[m.turn]];
+          rotatingD = !m.open;
+          if (!m.open) { armAt = nextBoundaryAt(m, (orderNode && orderNode.createdAt) || Date.now(), DELIVERY_NEAREST_TIMEOUT_MS); poolInfoD = poolFields(m); }
+        } else {
+          chosen = Object.entries(drivers).filter(([id, d]) => d && deliveryMatch(d) && d.fcmToken && inZoneD(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
+        }
       } else {
-        chosen = Object.entries(drivers).filter(([id, d]) => d && matchFilter(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
+        chosen = Object.entries(drivers).filter(([id, d]) => d && deliveryMatch(d) && d.fcmToken && inZoneD(d)).map(([id, d]) => ({ id, driver: d, distanceKm: null }));
       }
+
+      chosen = chosen.slice(0, MAX_FCM_SENDS);   // stay under subrequest limit
 
       tokens = chosen.map(c => c.driver.fcmToken).filter(Boolean);
-      if (!tokens.length) {
-        return new Response('No online drivers with a token', { status: 200, headers: corsHeaders });
-      }
 
-      if (pickup && chosen.length === 1 && chosen[0].distanceKm != null) {
+      if (pickup && rotatingD) {
         dispatchWrite = {
           path: `restaurants/${restId}/orders/${orderId}`,
-          body: { dispatch: { stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat: pickup.lat, pickupLng: pickup.lng } },
-          queue: { key: 'd_' + restId + '__' + orderId, value: { kind: 'delivery', restId, orderId, notifiedAt: Date.now() } },
+          body: { dispatch: Object.assign({ stage: 'nearest', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now(), pickupLat: pickup.lat, pickupLng: pickup.lng }, poolInfoD || {}) },
+          // shop details are cached here so the cron never has to re-read them every minute
+          queue: { key: 'd_' + restId + '__' + orderId, value: { kind: 'delivery', restId, orderId, notifiedAt: Date.now(),
+            rest: { name: rest.name || null, restaurantName: rest.restaurantName || null, address: rest.address || null, phone: rest.phone || null } } },
+          nearest: true,
         };
+      } else {
+        // Broadcast / fallback case: still record who was rung so cancel_ring can stop them.
+        dispatchWrite = {
+          path: `restaurants/${restId}/orders/${orderId}`,
+          body: { dispatch: { stage: 'broadcast', notifiedIds: chosen.map(c => c.id), notifiedAt: Date.now() } },
+          union: true, needsNode: true,
+        };
+      }
+      if (!tokens.length) {
+        if (dispatchWrite.nearest && orderNode) { await persistDispatchNow(env, dbUrl, dispatchWrite); await armTicker(env, armAt); }
+        return new Response('No push token for the driver whose turn it is', { status: 200, headers: corsHeaders });
       }
 
       notifTitle = 'New Delivery' + (orderNumber ? ' #' + orderNumber : '') + (restName ? ' — ' + restName : '');
@@ -631,6 +1047,8 @@ export default {
         totalAmount: totalAmount != null ? String(totalAmount) : '',
         deliveryFee: deliveryFee != null ? String(deliveryFee) : '',
       };
+      srcNodeFound = !!orderNode;
+      addPopupPayload(dataPayload, notifTitle, notifBody, buildDeliveryPayload(orderNode, rest, body));
 
       // Reuse the existing order-alert channel/sound so no sw.js change
       // is required to hear it.
@@ -802,7 +1220,7 @@ export default {
     //    has been fully killed, which is what lets each app show its own
     //    full-screen ringing UI (like an incoming call) instead of a
     //    plain system notification.
-    const sendResults = await Promise.all(tokens.map(async (token) => {
+    const sendOne = async (token) => {
       const isSilentData = SILENT_DATA_TYPES.has(dataPayload.type);
       const isFullScreenAlert = FULL_SCREEN_ALERT_TYPES.has(dataPayload.type);
       const message = isSilentData
@@ -812,19 +1230,19 @@ export default {
             // reaches the app's FirebaseMessagingService even if the app
             // is fully killed, same as the full-screen alerts below.
             token,
-            data: dataPayload,
+            data: strData(dataPayload),
             android: { priority: 'high' },
           }
         : isFullScreenAlert
         ? {
             token,
-            data: Object.assign({}, dataPayload, { title: notifTitle, body: notifBody }),
+            data: strData(Object.assign({}, dataPayload, { title: notifTitle, body: notifBody })),
             android: { priority: 'high' },
           }
         : {
             token,
             notification: { title: notifTitle, body: notifBody },
-            data: dataPayload,
+            data: strData(dataPayload),
             android: {
               priority: 'high',
               notification: { channel_id: channelId, sound: soundName, title: notifTitle, body: notifBody },
@@ -843,7 +1261,26 @@ export default {
       );
       const result = await fcmRes.json().catch(() => ({}));
       return { ok: fcmRes.ok, result };
-    }));
+    };
+    const sendResults = await Promise.all(tokens.map(sendOne));
+
+    // Nearest-first: if the nearest driver's push FAILED (dead / unregistered token ...), nobody is
+    // ringing. Do not wait for the cron escalation (25-85 s) - try the next-nearest drivers right now.
+    if (dispatchWrite && dispatchWrite.nearest && sendResults.length === 1) {
+      const tried = [dispatchWrite.body.dispatch.notifiedIds[0]];
+      let n = 0;
+      while (!sendResults.some(r => r.ok) && retryPool.length && n < 3) {
+        const nx = retryPool.shift(); n++;
+        const tk = nx.driver && nx.driver.fcmToken;
+        if (!tk) continue;
+        tried.push(nx.id);
+        tokens.push(tk);
+        sendResults.push(await sendOne(tk));
+      }
+      dispatchWrite.body.dispatch.notifiedIds = tried;
+      // nobody could be reached -> let the very next cron run widen to everyone instead of waiting out the window
+      if (!sendResults.some(r => r.ok)) dispatchWrite.body.dispatch.notifiedAt = Date.now() - nearestTimeoutMs;
+    }
 
     // Operator alerts: forget any device whose token FCM says is dead.
     if (operatorKeyByToken) {
@@ -865,7 +1302,13 @@ export default {
     //    is still in its nearest-driver-only window or is due to widen
     //    into a full broadcast. Best-effort — a failed write here just
     //    means escalation timing falls back to the ride's own createdAt.
-    if (dispatchWrite) {
+    if (dispatchWrite && (!dispatchWrite.needsNode || srcNodeFound)) {
+      if (dispatchWrite.union) {
+        // keep ids an earlier dispatch of the same job already rang, so cancel_ring still reaches all of them
+        const prev = await rtdbGet(dbUrl, `${dispatchWrite.path}/dispatch/notifiedIds`, accessToken);
+        const prevIds = Array.isArray(prev) ? prev : (prev && typeof prev === 'object' ? Object.values(prev) : []);
+        dispatchWrite.body.dispatch.notifiedIds = Array.from(new Set([...prevIds, ...dispatchWrite.body.dispatch.notifiedIds]));
+      }
       await fetch(`${dbUrl}/${dispatchWrite.path}.json`, {
         method: 'PATCH',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -879,6 +1322,7 @@ export default {
         });
         // one retry — if this entry were lost, the nearest->broadcast escalation would not fire
         await putQueue().then((r) => { if (!r.ok) return putQueue(); }).catch(() => putQueue().catch(() => {}));
+        await armTicker(env, armAt);   // exact-time wake-up for the next driver's turn (no-op without the JOB_TICKER binding)
       }
     }
 
@@ -903,12 +1347,50 @@ export default {
   },
 };
 
+// ---------------------------------------------------------------------
+// EXACT-TIME TICKER (optional Durable Object). Cron only runs once a minute, so a closed-app driver's push
+// could come up to 60 s late. With the JOB_TICKER binding (see DEPLOY note at the top) an alarm wakes this
+// Worker exactly when the next driver's turn starts, runs the same sweep, and re-arms itself for the next
+// turn. Without the binding nothing changes: cron keeps doing the work (up to 60 s later).
+// ---------------------------------------------------------------------
+// When does the next turn start (or the rotation open to everyone)?
+function nextBoundaryAt(m, createdAt, windowMs) {
+  const elapsed = Math.max(0, Date.now() - (createdAt || 0));
+  const k = Math.floor(elapsed / windowMs) + 1;
+  return (createdAt || 0) + (k <= m.total - 1 ? k : m.total + 1) * windowMs;
+}
+async function armTicker(env, at) {
+  try {
+    if (!env || !env.JOB_TICKER || !at) return;
+    const stub = env.JOB_TICKER.get(env.JOB_TICKER.idFromName('ticker'));
+    await stub.fetch('https://ticker/arm', { method: 'POST', body: JSON.stringify({ at }) });
+  } catch (e) { /* cron is the safety net */ }
+}
+export class JobTimer {
+  constructor(state, env) { this.state = state; this.env = env; }
+  async fetch(request) {
+    try { const b = await request.json(); await this.arm(b && b.at); } catch (e) {}
+    return new Response('ok');
+  }
+  async arm(at) {
+    if (!at) return;
+    const cur = await this.state.storage.getAlarm();
+    const t = Math.max(Date.now() + 200, at);
+    if (!cur || t < cur) await this.state.storage.setAlarm(t);
+  }
+  async alarm() {
+    const nextAts = [];
+    try { await runEscalationSweep(this.env, nextAts); } catch (e) {}
+    if (nextAts.length) { try { await this.arm(Math.min(...nextAts)); } catch (e) {} }
+  }
+}
+
 // Escalation sweep. BEFORE: every minute it downloaded rides.json + taxi_drivers.json +
 // restaurants.json (all shops, menus, order history) even when nothing was waiting.
 // NOW: it reads only dispatch_queue (a few tiny entries written when a nearest-driver
 // offer goes out). Empty queue -> returns immediately, almost zero bandwidth.
 // Escalation rules / timing / messages are unchanged.
-async function runEscalationSweep(env) {
+async function runEscalationSweep(env, nextAts = []) {   // nextAts is filled with the time of each open job's next turn
   const dbUrl = env.FIREBASE_DB_URL.replace(/\/$/, '');
   const serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
   const projectId = serviceAccount.project_id;
@@ -937,15 +1419,19 @@ async function runEscalationSweep(env) {
         const d = ride && ride.dispatch;
         // ride gone / accepted / cancelled / already broadcast -> nothing left to do
         if (!ride || ride.status !== 'searching' || !d || d.stage !== 'nearest') { await dropQueue(key); return; }
-        if (now - (d.notifiedAt || 0) < NEAREST_TIMEOUT_MS) return;
+        // a job pinned to one specific driver (operator-assigned / customer-chosen) is never rotated
+        if (ride.assignedDriverId || ride.candidateDriverId || ride.chosenDriverId) { await dropQueue(key); return; }
         due.push({ key, kind: 'ride', rideId: q.rideId, ride, d });
       } else if (q.kind === 'delivery' && q.restId && q.orderId) {
         const order = await rtdbGet(dbUrl, `restaurants/${q.restId}/orders/${q.orderId}`, token);
         const d = order && order.dispatch;
         if (!order || order.status !== 'ready' || order.deliveryDriverId || !d || d.stage !== 'nearest') { await dropQueue(key); return; }
-        if (now - (d.notifiedAt || 0) < DELIVERY_NEAREST_TIMEOUT_MS) return;
-        const rest = await rtdbFields(dbUrl, `restaurants/${q.restId}`, ['goSeries', 'location', 'name'], token);
-        if (!rest.goSeries) { await dropQueue(key); return; }
+        if (order.assignedDriverId) { await dropQueue(key); return; }
+        let rest = (q.rest && typeof q.rest === 'object') ? q.rest : null;   // cached when the job was created (goSeries was already checked then)
+        if (!rest) {
+          rest = await rtdbFields(dbUrl, `restaurants/${q.restId}`, ['goSeries', 'location', 'name', 'restaurantName', 'address', 'phone'], token);
+          if (!rest.goSeries) { await dropQueue(key); return; }
+        }
         due.push({ key, kind: 'delivery', restId: q.restId, orderId: q.orderId, order, d, rest });
       } else {
         await dropQueue(key);   // unknown/garbled entry
@@ -957,17 +1443,24 @@ async function runEscalationSweep(env) {
   const drivers = await fetchOnlineDrivers(dbUrl);   // only fetched when something is actually due
 
   const jobs = [];
-  due.forEach((x) => {
+  let fcmBudget = MAX_FCM_SENDS;   // shared across all due jobs in this run
+  await Promise.all(due.map(async (x) => {
     const d = x.d;
     if (x.kind === 'ride') {
       const ride = x.ride, rideId = x.rideId;
       const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : (ride.pickup || null);
       if (!pickup) return;
-      const matchFilter = dr => dr.isOnline === true && dr.vehicleType === ride.vehicleType && dr.fcmToken && (!dr.services || dr.services.taxi !== false) && !(d.notifiedIds || []).includes(dr._id);
-      const ranked = rankDriversByDistance(drivers, pickup, () => true)
-        .filter(r => matchFilter(Object.assign({ _id: r.id }, r.driver)))
-        .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-      if (!ranked.length) return;
+      const rmatch = dr => dr.isOnline === true && dr.vehicleType === ride.vehicleType && (!dr.services || dr.services.taxi !== false);
+      const zoneFn = (await zoneFilterFor(dbUrl, pickup, false)) || null;
+      const m = poolMatch(d, drivers, ride.createdAt, NEAREST_TIMEOUT_MS) || await matchJob({ drivers, pickup, matchFn: rmatch, zoneFn, createdAt: ride.createdAt, windowMs: NEAREST_TIMEOUT_MS, road: roadOf(ride) });
+      if (m.total && !m.open) nextAts.push(nextBoundaryAt(m, ride.createdAt, NEAREST_TIMEOUT_MS));
+      if (!m.total) return;   // nobody matching right now (the app shows it to nobody either)
+      const sel = selectTargets(m, d);
+      const withTok = sel.targets.filter(r => r.driver.fcmToken);
+      const ranked = withTok.slice(0, Math.max(0, fcmBudget));
+      const fin = sel.fin && ranked.length === withTok.length;   // everything rung and rotation over -> stop watching
+      if (!ranked.length && !fin) return;   // nothing new to ring this minute
+      fcmBudget -= ranked.length;
       jobs.push({
         key: x.key, kind: 'ride', id: rideId, path: `rides/${rideId}`,
         tokens: ranked.map(r => r.driver.fcmToken),
@@ -977,15 +1470,22 @@ async function runEscalationSweep(env) {
         data: { type: 'new_ride', rideId, pickupAddress: ride.pickup?.text || '', dropAddress: ride.drop?.text || '', customerName: ride.customerName || '', customerPhone: ride.customerNumber || '', fare: ride.fare != null ? String(ride.fare) : '', vehicleType: ride.vehicleType || '' },
         channelId: 'ride_alerts', soundName: 'ride_alert',
       });
+      { const jb = jobs[jobs.length - 1]; jb.fin = fin; jb.d0 = d; addPopupPayload(jb.data, jb.title, jb.body, buildRidePayload(ride, {})); }
     } else {
       const { restId, orderId, order, rest } = x;
       const pickup = (typeof d.pickupLat === 'number' && typeof d.pickupLng === 'number') ? { lat: d.pickupLat, lng: d.pickupLng } : parseLatLngStr(rest.location);
       if (!pickup) return;
-      const matchFilter = dr => dr.isOnline === true && dr.vehicleType === 'bike' && dr.fcmToken && (!dr.services || dr.services.delivery !== false) && !(d.notifiedIds || []).includes(dr._id);
-      const ranked = rankDriversByDistance(drivers, pickup, () => true)
-        .filter(r => matchFilter(Object.assign({ _id: r.id }, r.driver)))
-        .filter(r => r.distanceKm == null || r.distanceKm <= MAX_MATCH_RADIUS_KM);
-      if (!ranked.length) return;
+      const dmatch = dr => dr.isOnline === true && dr.vehicleType === 'bike' && (!dr.services || dr.services.delivery !== false);
+      const zoneFn = (await zoneFilterFor(dbUrl, pickup, true)) || null;
+      const m = poolMatch(d, drivers, order.createdAt, DELIVERY_NEAREST_TIMEOUT_MS) || await matchJob({ drivers, pickup, matchFn: dmatch, zoneFn, createdAt: order.createdAt, windowMs: DELIVERY_NEAREST_TIMEOUT_MS, road: roadOf(order) });
+      if (m.total && !m.open) nextAts.push(nextBoundaryAt(m, order.createdAt, DELIVERY_NEAREST_TIMEOUT_MS));
+      if (!m.total) return;
+      const sel = selectTargets(m, d);
+      const withTok = sel.targets.filter(r => r.driver.fcmToken);
+      const ranked = withTok.slice(0, Math.max(0, fcmBudget));
+      const fin = sel.fin && ranked.length === withTok.length;
+      if (!ranked.length && !fin) return;
+      fcmBudget -= ranked.length;
       jobs.push({
         key: x.key, kind: 'delivery', id: `${restId}::${orderId}`, path: `restaurants/${restId}/orders/${orderId}`,
         tokens: ranked.map(r => r.driver.fcmToken),
@@ -995,18 +1495,19 @@ async function runEscalationSweep(env) {
         data: { type: 'new_delivery', restId, orderId, restName: rest.name || '', orderNumber: order.orderNumber || '', itemsSummary: order.itemsSummary || '', customerName: order.customerName || '', customerPhone: order.customerPhone || '', customerAddress: order.customerAddress || '', totalAmount: order.totalAmount != null ? String(order.totalAmount) : '', deliveryFee: order.deliveryFee != null ? String(order.deliveryFee) : '' },
         channelId: 'order_alerts', soundName: 'order_alert',
       });
+      { const jb = jobs[jobs.length - 1]; jb.fin = fin; jb.d0 = d; addPopupPayload(jb.data, jb.title, jb.body, buildDeliveryPayload(order, rest, {})); }
     }
-  });
+  }));
 
   if (!jobs.length) return;
 
   await Promise.all(jobs.map(async (job) => {
     const isFullScreenAlert = FULL_SCREEN_ALERT_TYPES.has(job.data.type);
     const message = isFullScreenAlert
-      ? { data: Object.assign({}, job.data, { title: job.title, body: job.body }), android: { priority: 'high' } }
+      ? { data: strData(Object.assign({}, job.data, { title: job.title, body: job.body })), android: { priority: 'high' } }
       : {
           notification: { title: job.title, body: job.body },
-          data: job.data,
+          data: strData(job.data),
           android: { priority: 'high', notification: { channel_id: job.channelId, sound: job.soundName, title: job.title, body: job.body } },
         };
     await Promise.all(job.tokens.filter(Boolean).map(fcmToken =>
@@ -1019,9 +1520,10 @@ async function runEscalationSweep(env) {
     await fetch(`${dbUrl}/${job.path}.json`, {
       method: 'PATCH',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dispatch: { stage: 'broadcast', notifiedIds: job.notifiedIds, notifiedAt: now } }),
+      // keep pickupLat/pickupLng etc. from the existing dispatch object: the next cron tick needs them
+      body: JSON.stringify({ dispatch: Object.assign({}, job.d0 || {}, { stage: job.fin ? 'broadcast' : 'nearest', notifiedIds: job.notifiedIds, notifiedAt: now }) }),
     }).catch(() => {});
-    await dropQueue(job.key);   // broadcast done -> nothing more to watch
+    if (job.fin) await dropQueue(job.key);   // rotation over and everyone rung -> nothing more to watch
   }));
 }
 
