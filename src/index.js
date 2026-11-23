@@ -348,25 +348,9 @@ async function zoneFilterFor(dbUrl, pickup, useGroup) {
 // ---- ORACLE DISPATCH SWITCH: when the server (dispatch.js) owns a job's zone, the Worker does nothing ----
 // app_config/oracleDispatch = "zoneA,zoneB" | true | absent. oracleDispatchBeat = ms, written by the server every 30 s.
 // If the beat is older than 90 s the server is considered down and the Worker keeps working as before.
-let _oc = { at: 0, cfg: null, beat: 0 };
-async function oracleCovers(dbUrl, getPickup, useGroup) {
-  try {
-    if (Date.now() - _oc.at > 60000) {
-      const [cfg, beat] = await Promise.all([rtdbGet(dbUrl, 'app_config/oracleDispatch'), rtdbGet(dbUrl, 'app_config/oracleDispatchBeat')]);
-      _oc = { at: Date.now(), cfg, beat: Number(beat) || 0 };
-    }
-    const cfg = _oc.cfg;
-    if (!cfg) return false;
-    if (_oc.at - _oc.beat > 90000) return false;                 // server silent -> Worker takes over
-    if (cfg === true || cfg === 'true') return true;
-    const pickup = await getPickup();
-    if (!pickup) return false;
-    const zones = await getZones(dbUrl);
-    const hit = zones && zones.find(z => z.bounds.length >= 3 && pointInBounds(pickup, z.bounds));
-    if (!hit) return false;
-    return String(cfg).split(',').map(s => s.trim()).includes(hit._id);
-  } catch (e) { return false; }
-}
+// ORACLE-ONLY (23 Nov 2026): the Worker no longer rings drivers for new rides/deliveries in ANY zone. Dispatch is done only by the Oracle server
+// (dispatch.js). No config check, no heartbeat takeover. (Cancel/accept pushes, shop and customer pushes are separate code paths and unchanged.)
+async function oracleCovers(dbUrl, getPickup, useGroup) { return true; }
 const ORACLE_SKIP = (corsHeaders) => new Response(JSON.stringify({ skipped: 'oracle' }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 // =====================================================================
