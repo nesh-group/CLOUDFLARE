@@ -1,10 +1,7 @@
 name = "broad-paper-6445"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+keep_vars = true
 
-[vars]
-FIREBASE_DB_URL = "YOUR_FIREBASE_DB_URL"
-FIREBASE_SERVICE_ACCOUNT_JSON = "YOUR_FIREBASE_SERVICE_ACCOUNT_JSON"
-
-[[triggers.crons]]
-cron = "* * * * *"
+[triggers]
+crons = ["* * * * *"]
