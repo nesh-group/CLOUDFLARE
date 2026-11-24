@@ -693,7 +693,8 @@ export default {
             message: {
               topic: topicName,
               notification: notificationPayload,
-              android: { priority: 'high', notification: notificationPayload },
+              // heads-up banner: 'nesh_offers' is a HIGH-importance channel created once by the customer app
+              android: { priority: 'high', notification: Object.assign({ channel_id: 'nesh_offers', notification_priority: 'PRIORITY_HIGH', visibility: 'PUBLIC', default_sound: true, default_vibrate_timings: true }, notificationPayload) },
             },
           }),
         }
